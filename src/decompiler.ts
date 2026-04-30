@@ -598,7 +598,7 @@ export class LavaXDecompiler {
       case 'LEA_L_D': { const idx = resolveAddr(stack.pop()); stack.push(helpers.typedHandle('long', `${getAddr(parseInt(args[0]))} + ${idx}`)); break; }
       case 'LEA_OFT': if (stack.length) stack[stack.length - 1] = `(${resolveAddr(stack[stack.length - 1])} + ${args[0]})`; break;
       case 'LEA_L_PH': if (stack.length) stack[stack.length - 1] = `(${resolveAddr(stack[stack.length - 1])} + ${args[0]})`; break;
-      case 'LEA_ABS': stack.push(resolveAddr(args[0])); break;
+      case 'LEA_ABS': stack.push(getAddr(parseInt(args[0]))); break;
       case 'PUSH_ADDR': if (stack.length) stack[stack.length - 1] = `(${resolveAddr(stack[stack.length - 1])} + ${args[0]})`; break;
       case 'STORE': {
         const val = resolveAddr(stack.pop());

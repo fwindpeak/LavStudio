@@ -468,8 +468,16 @@ export class LavaXCompiler {
                   this.initializers.push(`INIT ${this.globalOffset} ${byteValues.length} ${byteValues.join(' ')}`);
                 }
               } else {
-                const expr = this.parseToken(); // Simplified for pre-scan
-                const val = this.evalConstant(expr);
+                const firstTok = this.parseToken();
+                let val: number;
+                if (firstTok === '&') {
+                  // &globalVar — compile-time constant: address of a global variable
+                  const varName = this.parseToken();
+                  const gvar = this.globals.get(varName);
+                  val = gvar !== undefined ? gvar.offset : NaN;
+                } else {
+                  val = this.evalConstant(firstTok);
+                }
                 if (!isNaN(val)) {
                   if (elementSize === 1) this.initializers.push(`INIT ${this.globalOffset} 1 ${val & 0xFF}`);
                   else if (elementSize === 2) this.initializers.push(`INIT ${this.globalOffset} 2 ${val & 0xFF} ${(val >> 8) & 0xFF}`);
@@ -1195,6 +1203,41 @@ export class LavaXCompiler {
   private parseAssignment(): boolean {
     const token = this.peekToken();
 
+    // Support (type *)ptr = value  (LavaX pointer-cast lvalue)
+    const savedPosCast = this.pos;
+    const savedAsmLenCast = this.asm.length;
+    if (this.match('(')) {
+      const castType = this.parseToken();
+      if (['int', 'char', 'long', 'float', 'addr'].includes(castType)) {
+        let pDepth = 0;
+        while (this.match('*')) pDepth++;
+        if (pDepth > 0 && this.match(')')) {
+          this.parseUnary(); // parse the pointer expression onto the stack
+          const castOp = this.peekToken();
+          const isCastCompound = castOp.endsWith('=') && castOp.length > 1 && !['==', '!=', '<=', '>='].includes(castOp);
+          if (castOp === '=' || isCastCompound) {
+            this.parseToken(); // consume =
+            // CPTR/CIPTR/CLPTR strips upper bits and sets the cast type.
+            if (castType === 'char') this.asm.push('CPTR');
+            else if (castType === 'int') this.asm.push('CIPTR');
+            else this.asm.push('CLPTR'); // long, addr, float
+            if (isCastCompound) {
+              this.asm.push('DUP');
+              this.asm.push('LD_IND');
+              this.parseExpression();
+              this.emitCompoundOp(castOp);
+            } else {
+              this.parseExpression();
+            }
+            this.asm.push('STORE');
+            return true;
+          }
+        }
+      }
+      this.pos = savedPosCast;
+      this.asm.length = savedAsmLenCast;
+    }
+
     // Support *ptr = value
     const savedPos = this.pos;
     const savedAsmLen = this.asm.length;
@@ -1215,8 +1258,10 @@ export class LavaXCompiler {
         const isCompound = op.endsWith('=') && op.length > 1 && !['==', '!=', '<=', '>='].includes(op);
         if (op === '=' || isCompound) {
           this.parseToken(); // consume op
-          this.asm.push(`PUSH_D ${handleType}`);
-          this.asm.push('OR'); // Stack: [..., handle]
+          // Apply type via CPTR/CIPTR/CLPTR (strips upper bits, sets type).
+          if (handleType === '0x10000') this.asm.push('CPTR');
+          else if (handleType === '0x20000') this.asm.push('CIPTR');
+          else this.asm.push('CLPTR');
           if (isCompound) {
             this.asm.push('DUP');
             this.asm.push('LD_IND');
@@ -1524,17 +1569,17 @@ export class LavaXCompiler {
     } else if (this.match('(')) {
       const savedPos = this.pos;
       const token = this.parseToken();
-      if (['int', 'char', 'long', 'void', 'addr'].includes(token)) {
+      if (['int', 'char', 'long', 'void', 'addr', 'float'].includes(token)) {
         let pointerDepth = 0;
         while (this.match('*')) { pointerDepth++; }
         this.expect(')');
         this.parseUnary();
         if (pointerDepth > 0) {
-          let handleType = '0x10000';
-          if (token === 'int') handleType = '0x20000';
-          else if (token === 'long' || token === 'addr') handleType = '0x40000';
-          this.asm.push(`PUSH_D ${handleType}`);
-          this.asm.push('OR');
+          // LavaX (type *) reads from the address stored in the expression.
+          // CPTR/CIPTR/CLPTR strips upper bits and sets correct type, then LD_IND reads.
+          if (token === 'char') this.asm.push('CPTR');
+          else if (token === 'int') this.asm.push('CIPTR');
+          else this.asm.push('CLPTR'); // long, addr, float
           this.asm.push('LD_IND');
           return true;
         }
@@ -1555,18 +1600,15 @@ export class LavaXCompiler {
       // We should NOT OR additional type bits - just call LD_IND directly.
       // If the pointer came from an expression (not a direct variable), we may need type bits.
       if (variable && (variable as any).pointerDepth > 0) {
-        // The handle already has correct type bits encoded when the pointer was created via &
-        // Just dereference directly
-        this.asm.push('LD_IND');
+        // C-style typed pointer: apply the declared element type, then LD_IND.
+        if (variable.type === 'int') this.asm.push('CIPTR');
+        else if (variable.type === 'long' || variable.type === 'addr') this.asm.push('CLPTR');
+        else this.asm.push('CPTR'); // char
       } else {
-        // Fallback: pointer came from a complex expression, add type bits
-        let handleType = '0x10000';
-        if (variable && variable.type === 'int') handleType = '0x20000';
-        else if (variable && (variable.type === 'long' || variable.type === 'addr')) handleType = '0x40000';
-        this.asm.push(`PUSH_D ${handleType}`);
-        this.asm.push('OR');
-        this.asm.push('LD_IND');
+        // LavaX-style: * is shorthand for (char *) - always read 1 byte.
+        this.asm.push('CPTR');
       }
+      this.asm.push('LD_IND');
       return true;
     } else if (this.match('&')) {
       const token = this.peekToken();
@@ -1596,16 +1638,14 @@ export class LavaXCompiler {
           this.asm.push(`PUSH_D ${ptrHandleType}`);
           this.asm.push('OR');
         } else {
-          // For &variable, push the offset with EBP flag (for local) plus type bits
-          // so that pointer dereference (LD_IND) reads/writes the correct width.
-          this.asm.push(`PUSH_W ${variable.offset}`);
+          // For &variable, produce an absolute (not EBP-relative) raw address.
+          // Type bits are applied at the dereference site (CPTR/CIPTR/CLPTR), so no
+          // need to embed them here. This also avoids spurious globals in the decompiler.
           if (isLocal) {
-            this.asm.push('PUSH_D 0x800000');
-            this.asm.push('OR');
+            this.asm.push(`LEA_ABS ${variable.offset}`);
+          } else {
+            this.asm.push(`PUSH_W ${variable.offset}`);
           }
-          // Add type bits
-          this.asm.push(`PUSH_D ${ptrHandleType}`);
-          this.asm.push('OR');
         }
         return true;
       } else {
