@@ -20,13 +20,34 @@ export interface ILavaXVM {
     graphics: GraphicsEngine;
     stk: Int32Array;
     sp: number;
+    heldKeys: Uint8Array;
     currentKeyDown: number;
     delayUntil: number;
+    rngSeed: number;
     wakeUp(): void;
+    requestHostYield(ms: number): void;
 }
+
+const LTRUE = -1;
+const LFALSE = 0;
+const SIN90 = [
+    0, 18, 36, 54, 71, 89, 107, 125,
+    143, 160, 178, 195, 213, 230, 248, 265,
+    282, 299, 316, 333, 350, 367, 384, 400,
+    416, 433, 449, 465, 481, 496, 512, 527,
+    543, 558, 573, 587, 602, 616, 630, 644,
+    658, 672, 685, 698, 711, 724, 737, 749,
+    761, 773, 784, 796, 807, 818, 828, 839,
+    849, 859, 868, 878, 887, 896, 904, 912,
+    920, 928, 935, 943, 949, 956, 962, 968,
+    974, 979, 984, 989, 994, 998, 1002, 1005,
+    1008, 1011, 1014, 1016, 1018, 1020, 1022, 1023,
+    1023, 1024, 1024,
+];
 
 /**
  * LavaX Syscall Handler (GVM ISA V3.0)
+ * Source of truth for parameter counts and returns: src/vm/SyscallMetadata.ts
  */
 interface FileListState {
     files: string[];
@@ -37,7 +58,69 @@ interface FileListState {
 
 export class SyscallHandler {
     private fileListState: FileListState | null = null;
+    private fileHandleSlots = new Map<number, number>();
+    private emptyInputPolls = 0;
     constructor(private vm: ILavaXVM) { }
+
+    public resetState() {
+        this.fileListState = null;
+        this.fileHandleSlots.clear();
+        this.emptyInputPolls = 0;
+    }
+
+    private noteInputPolling(hasInput: boolean) {
+        if (hasInput) {
+            this.emptyInputPolls = 0;
+            return;
+        }
+
+        this.emptyInputPolls++;
+        if (this.emptyInputPolls >= 32) {
+            this.vm.requestHostYield(8);
+            this.emptyInputPolls = 0;
+        }
+    }
+
+    private getHeldKey(): number {
+        for (let key = 1; key < this.vm.heldKeys.length; key++) {
+            if (this.vm.heldKeys[key]) return key;
+        }
+        return 0;
+    }
+
+    private allocOfficialFileHandle(internalHandle: number): number {
+        for (let slot = 0x80; slot <= 0x82; slot++) {
+            if (!this.fileHandleSlots.has(slot)) {
+                this.fileHandleSlots.set(slot, internalHandle);
+                return slot;
+            }
+        }
+        return 0;
+    }
+
+    private resolveOfficialFileHandle(handle: number): number {
+        return this.fileHandleSlots.get(handle) ?? 0;
+    }
+
+    private nextRand(): number {
+        const next = (Math.imul(this.vm.rngSeed, 0x15a4e35) + 1) | 0;
+        this.vm.rngSeed = next;
+        return (next >>> 16) & 0x7fff;
+    }
+
+    private getMilliseconds256(): number {
+        return ((new Date().getMilliseconds() * 256) / 1000) & 0xFF;
+    }
+
+    private sin1024(angle: number): number {
+        let v = angle & 0xffff;
+        v %= 360;
+        if (v < 0) v += 360;
+        if (v < 90) return SIN90[v];
+        if (v < 180) return SIN90[180 - v];
+        if (v < 270) return -SIN90[v - 180];
+        return -SIN90[360 - v];
+    }
 
     public handleSync(op: number): number | null | undefined {
         const vm = this.vm;
@@ -50,11 +133,17 @@ export class SyscallHandler {
             const now = Date.now();
             if (vm.delayUntil === 0) {
                 // Peek the delay duration from stack (it's the top value)
-                const duration = vm.stk[vm.sp - 1];
-                vm.delayUntil = now + duration;
+                const duration = vm.stk[vm.sp - 1] & 0x7fff;
+                const ticks = Math.floor((duration * 256) / 1000);
+                if (ticks <= 0) {
+                    vm.pop();
+                    return null;
+                }
+                const delayMs = Math.ceil((ticks * 1000) / 256);
+                vm.delayUntil = now + delayMs;
                 setTimeout(() => {
                     vm.wakeUp();
-                }, duration);
+                }, delayMs);
                 return undefined; // Yield
             } else if (now < vm.delayUntil) {
                 return undefined; // Still waiting
@@ -263,6 +352,16 @@ export class SyscallHandler {
 
                 const oldMode = vm.graphics.graphMode;
                 vm.graphics.graphMode = mode;
+                if (mode === 4) {
+                    vm.graphics.bgColor = 0;
+                    vm.graphics.fgColor = 15;
+                } else if (mode === 8) {
+                    vm.graphics.bgColor = 0;
+                    vm.graphics.fgColor = 255;
+                } else {
+                    vm.graphics.bgColor = 0;
+                    vm.graphics.fgColor = 1;
+                }
                 // Clearing screen on mode change is common
                 vm.graphics.clearVRAM();
                 vm.graphics.clearGraphBuffer();
@@ -276,9 +375,9 @@ export class SyscallHandler {
                 const start = vm.pop();
                 for (let i = 0; i < num; i++) {
                     if (start + i >= 256) break;
-                    vm.graphics.palette[(start + i) * 4] = vm.memory[palAddr + i * 4];
+                    vm.graphics.palette[(start + i) * 4] = vm.memory[palAddr + i * 4 + 2];
                     vm.graphics.palette[(start + i) * 4 + 1] = vm.memory[palAddr + i * 4 + 1];
-                    vm.graphics.palette[(start + i) * 4 + 2] = vm.memory[palAddr + i * 4 + 2];
+                    vm.graphics.palette[(start + i) * 4 + 2] = vm.memory[palAddr + i * 4];
                     vm.graphics.palette[(start + i) * 4 + 3] = 255;
                 }
                 return num;
@@ -286,25 +385,32 @@ export class SyscallHandler {
             case SystemOp.SetFgColor: {
                 const color = vm.pop();
                 const old = vm.graphics.fgColor;
-                vm.graphics.fgColor = color;
+                vm.graphics.fgColor = vm.graphics.graphMode === 8 ? (color & 0xFF) : (color & 0x0F);
                 return old;
             }
             case SystemOp.SetBgColor: {
                 const color = vm.pop();
                 const old = vm.graphics.bgColor;
-                vm.graphics.bgColor = color;
+                vm.graphics.bgColor = vm.graphics.graphMode === 8 ? (color & 0xFF) : (color & 0x0F);
                 return old;
             }
             case SystemOp.exit: vm.pop(); vm.running = false; return 0;
             case SystemOp.ClearScreen: vm.graphics.clearGraphBuffer(); return null;
             case SystemOp.abs: return Math.abs(vm.pop());
-            case SystemOp.rand: return (Math.random() * 0x8000) | 0;
-            case SystemOp.srand: vm.pop(); return 0; // Fixed: pop seed
+            case SystemOp.rand: return this.nextRand();
+            case SystemOp.srand:
+                vm.rngSeed = vm.pop() | 0;
+                return null;
             case SystemOp.getchar: {
                 if (vm.keyBuffer.length === 0) return undefined;
+                this.noteInputPolling(true);
                 return vm.keyBuffer.shift()!;
             }
-            case SystemOp.Inkey: return vm.keyBuffer.length > 0 ? vm.keyBuffer.shift()! : 0;
+            case SystemOp.Inkey: {
+                const hasInput = vm.keyBuffer.length > 0;
+                this.noteInputPolling(hasInput);
+                return hasInput ? vm.keyBuffer.shift()! : 0;
+            }
 
             case SystemOp.isalnum: return /^[a-z0-9]$/i.test(String.fromCharCode(vm.pop())) ? -1 : 0;
             case SystemOp.isalpha: return /^[a-z]$/i.test(String.fromCharCode(vm.pop())) ? -1 : 0;
@@ -407,17 +513,28 @@ export class SyscallHandler {
                 const m = vm.getStringBytes(vm.pop()), p = vm.getStringBytes(vm.pop());
                 if (!p || !m) return 0;
                 const dec = new TextDecoder('gbk');
-                const handle = vm.vfs.openFile(dec.decode(p), dec.decode(m));
-                return handle <= 0 ? 0 : handle;
+                const internalHandle = vm.vfs.openFile(dec.decode(p), dec.decode(m));
+                if (internalHandle <= 0) return 0;
+                const officialHandle = this.allocOfficialFileHandle(internalHandle);
+                if (officialHandle === 0) {
+                    vm.vfs.closeFile(internalHandle);
+                    return 0;
+                }
+                return officialHandle;
             }
             case SystemOp.fclose: {
-                vm.vfs.closeFile(vm.pop());
+                const handle = vm.pop();
+                const internalHandle = this.resolveOfficialFileHandle(handle);
+                if (internalHandle) {
+                    vm.vfs.closeFile(internalHandle);
+                    this.fileHandleSlots.delete(handle);
+                }
                 return null;
             }
             case SystemOp.fread: {
                 // Stack: [buf, size, count, fp]
                 const fp = vm.pop(), count = vm.pop(), size = vm.pop(), buf = vm.resolveAddress(vm.pop());
-                const h = vm.vfs.getHandle(fp);
+                const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(fp));
                 if (!h) return 0;
                 
                 // LavaX spec: size is ignored, count is number of bytes
@@ -432,16 +549,17 @@ export class SyscallHandler {
             case SystemOp.fwrite: {
                 // Stack: [buf, size, count, fp]
                 const fp = vm.pop(), count = vm.pop(), size = vm.pop(), buf = vm.resolveAddress(vm.pop());
-                const h = vm.vfs.getHandle(fp);
+                const internalHandle = this.resolveOfficialFileHandle(fp);
+                const h = vm.vfs.getHandle(internalHandle);
                 if (!h) return 0;
 
                 // LavaX spec: size is ignored, count is number of bytes
                 const data = vm.memory.subarray(buf, buf + count);
-                return vm.vfs.writeHandleData(fp, data, h.pos);
+                return vm.vfs.writeHandleData(internalHandle, data, h.pos);
             }
             case SystemOp.fseek: {
                 const whence = vm.pop(), offset = vm.pop(), fp = vm.pop();
-                const h = vm.vfs.getHandle(fp);
+                const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(fp));
                 if (!h) return -1;
                 
                 let newPos = h.pos;
@@ -454,27 +572,28 @@ export class SyscallHandler {
                 return h.pos; // Return current position
             }
             case SystemOp.ftell: {
-                const h = vm.vfs.getHandle(vm.pop());
+                const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(vm.pop()));
                 return h ? h.pos : -1;
             }
             case SystemOp.feof: {
-                const h = vm.vfs.getHandle(vm.pop());
+                const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(vm.pop()));
                 return h ? (h.pos >= h.data.length ? -1 : 0) : -1;
             }
             case SystemOp.rewind: {
-                const h = vm.vfs.getHandle(vm.pop());
+                const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(vm.pop()));
                 if (h) h.pos = 0;
                 return null;
             }
             case SystemOp.getc: {
-                const h = vm.vfs.getHandle(vm.pop());
+                const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(vm.pop()));
                 return (h && h.pos < h.data.length) ? h.data[h.pos++] : -1;
             }
             case SystemOp.putc: {
                 const fp = vm.pop(), char = vm.pop();
-                const h = vm.vfs.getHandle(fp);
+                const internalHandle = this.resolveOfficialFileHandle(fp);
+                const h = vm.vfs.getHandle(internalHandle);
                 if (h) {
-                    vm.vfs.writeHandleData(fp, new Uint8Array([char]), h.pos);
+                    vm.vfs.writeHandleData(internalHandle, new Uint8Array([char]), h.pos);
                     return char;
                 }
                 return -1;
@@ -606,20 +725,17 @@ export class SyscallHandler {
                 return 0;
             }
 
-            case SystemOp.Getms: return Date.now() - vm.startTime;
+            case SystemOp.Getms: return this.getMilliseconds256();
             case SystemOp.CheckKey: {
                 const keyToCheck = vm.pop(); // Consume key argument
-                let hold = 0;
                 if (keyToCheck < 128) {
-                    // Check if a specific key is held
-                    hold = (vm.currentKeyDown === keyToCheck) ? keyToCheck : 0;
-                } else {
-                    // key >= 128: return any currently held key
-                    hold = vm.currentKeyDown;
+                    const held = vm.heldKeys[keyToCheck & 0xFF] ? LTRUE : LFALSE;
+                    this.noteInputPolling(held !== LFALSE);
+                    return held;
                 }
-                // CheckKey is non-blocking: always return immediately.
-                // Yielding is handled by the run-loop's internalYieldCount and rAF mechanisms.
-                return hold;
+                const anyHeld = this.getHeldKey() || LFALSE;
+                this.noteInputPolling(anyHeld !== LFALSE);
+                return anyHeld;
             }
             case SystemOp.memmove: {
                 const count = vm.pop(), src = vm.resolveAddress(vm.pop()), dest = vm.resolveAddress(vm.pop());
@@ -656,37 +772,15 @@ export class SyscallHandler {
                 return null;
             }
             case SystemOp.GetWord: {
-                // If key buffer is empty, wait for input
+                vm.pop(); // mode argument is ignored by the official C VM path
                 if (vm.keyBuffer.length === 0) return undefined;
-
-                const b1 = vm.keyBuffer[0];
-                // Check if b1 is a GBK lead byte (0x81-0xFE)
-                if (b1 >= 0x81 && b1 <= 0xFE) {
-                    // Need at least 2 bytes for a Chinese character
-                    if (vm.keyBuffer.length < 2) {
-                        return undefined; // Wait for the second byte
-                    }
-                    vm.pop(); // Consume mode argument
-                    vm.keyBuffer.shift(); // Remove b1
-                    const b2 = vm.keyBuffer.shift()!; // Remove b2
-                    return (b2 << 8) | b1;
-                } else {
-                    // Single byte character
-                    vm.pop(); // Consume mode argument
-                    return vm.keyBuffer.shift();
-                }
+                this.noteInputPolling(true);
+                return vm.keyBuffer.shift()!;
             }
-            case SystemOp.Sin: {
-                const v = vm.pop();
-                // LavaX spec: returns sin(deg) * 1024, range -1024~1024
-                return (Math.sin(v * Math.PI / 180) * 1024) | 0;
-            }
-            case SystemOp.Cos: {
-                const v = vm.pop();
-                // LavaX spec: returns cos(deg) * 1024, range -1024~1024
-                return (Math.cos(v * Math.PI / 180) * 1024) | 0;
-            }
+            case SystemOp.Sin: return this.sin1024(vm.pop());
+            case SystemOp.Cos: return this.sin1024((vm.pop() + 90) | 0);
             case SystemOp.PutKey: {
+                this.noteInputPolling(true);
                 vm.keyBuffer.push(vm.pop());
                 return 0;
             }
@@ -735,9 +829,25 @@ export class SyscallHandler {
             case SystemOp.SetVolume:
                 vm.pop();
                 return null;
-            case SystemOp.ReleaseKey:
-                vm.pop();
+            case SystemOp.ReleaseKey: {
+                const key = vm.pop();
+                if (key < 128) {
+                    vm.heldKeys[key & 0xFF] = 0;
+                    if (vm.currentKeyDown === key) {
+                        vm.currentKeyDown = this.getHeldKey();
+                    }
+                    for (let i = vm.keyBuffer.length - 1; i >= 0; i--) {
+                        if (vm.keyBuffer[i] === key) {
+                            vm.keyBuffer.splice(i, 1);
+                        }
+                    }
+                } else {
+                    vm.heldKeys.fill(0);
+                    vm.currentKeyDown = 0;
+                    vm.keyBuffer.length = 0;
+                }
                 return null;
+            }
             case SystemOp.open_key:
             case SystemOp.close_key:
                 // Keyboard lock/unlock - no-op in browser
@@ -793,7 +903,9 @@ export class SyscallHandler {
                     case SystemCoreOp.GetPID: return 100;
                     case SystemCoreOp.GetBrightness: return 100;
                     case SystemCoreOp.GetVersion: return 0x0300; // V3.0
-                    case SystemCoreOp.Idle: return;
+                    case SystemCoreOp.Idle:
+                        vm.requestHostYield(1);
+                        return null;
                 }
                 return 0;
             }

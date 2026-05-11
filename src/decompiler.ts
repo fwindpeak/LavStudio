@@ -6,9 +6,17 @@ import {
   HANDLE_TYPE_DWORD,
   HANDLE_TYPE_WORD,
   Op,
-  SystemOp,
 } from './types';
-import iconv from 'iconv-lite';
+import {
+  formatPushString,
+  isJumpMnemonic,
+  isUnsignedWordMnemonic,
+  LAV_HEADER_SIZE,
+  OperandType,
+  type LavInstructionNode,
+} from './lav/format';
+import { LavParser } from './vst/LavParser';
+import { SYSCALL_MAP, SYSCALL_OP_MAP } from './vm/SyscallMetadata';
 
 // Instructions that consume the top-of-stack value (used to detect non-void return usage)
 const VALUE_CONSUMER_OPS = new Set([
@@ -18,67 +26,81 @@ const VALUE_CONSUMER_OPS = new Set([
   'INC_PRE','DEC_PRE','INC_POS','DEC_POS','DUP',
 ]);
 
-const UNSIGNED_WORD_OPS = new Set<number>([
-  Op.LD_G_B, Op.LD_G_W, Op.LD_G_D,
-  Op.LEA_G_B, Op.LEA_G_W, Op.LEA_G_D,
-  Op.LD_G_O_B, Op.LD_G_O_W, Op.LD_G_O_D,
-  Op.LD_TEXT, Op.LD_GRAP, Op.LEA_ABS,
-]);
-
-const COMBO_IMM_OPS = new Set<number>([
-  Op.ADD_C, Op.SUB_C, Op.MUL_C, Op.DIV_C, Op.MOD_C, Op.SHL_C, Op.SHR_C,
-  Op.EQ_C, Op.NEQ_C, Op.GT_C, Op.LT_C, Op.GE_C, Op.LE_C,
-]);
-
 export class LavaXDecompiler {
   private labelToAddr = new Map<string, number>();
   private addrToLine = new Map<number, number>();
 
   disassemble(lav: Uint8Array): string {
-    if (lav.length < 16) return "// Invalid LAV file";
-    const ops = lav.slice(16);
-    const lines: string[] = [];
-    const jumpTargets = new Set<number>();
-    let ip = 0;
-    while (ip < ops.length) {
-      const op = ops[ip++];
-      if ([Op.JMP, Op.JZ, Op.JNZ, Op.CALL].includes(op)) {
-        const addr = (ops[ip] | (ops[ip + 1] << 8) | (ops[ip + 2] << 16)) - 16;
-        jumpTargets.add(addr);
-        ip += 3;
-      } else if ([Op.PUSH_B, Op.MASK, Op.PASS, Op.STORE_EXT, Op.IDX].includes(op)) ip += 1;
-      else if ([Op.PUSH_W, Op.LD_G_B, Op.LD_G_W, Op.LD_G_D, Op.LEA_G_B, Op.LEA_G_W, Op.LEA_G_D, Op.LD_L_B, Op.LD_L_W, Op.LD_L_D, Op.LEA_L_B, Op.LEA_L_W, Op.LEA_L_D, Op.LEA_OFT, Op.LEA_L_PH, Op.LEA_ABS, Op.PUSH_ADDR, Op.SPACE, Op.INIT, Op.LD_G_O_B, Op.LD_G_O_W, Op.LD_G_O_D, Op.LD_L_O_B, Op.LD_L_O_W, Op.LD_L_O_D].includes(op) || COMBO_IMM_OPS.has(op)) {
-        if (op === Op.INIT) { const len = ops[ip + 2] | (ops[ip + 3] << 8); ip += 4 + len; } else ip += 2;
-      } else if (op === Op.PUSH_D) ip += 4;
-      else if (op === Op.FUNC || op === Op.DBG || op === Op.FUNCID) ip += 3;
-      else if (op === Op.PUSH_STR) { while (ops[ip] !== 0 && ip < ops.length) ip++; ip++; }
-    }
-    ip = 0;
-    while (ip < ops.length) {
-      const addr = ip;
-      if (jumpTargets.has(addr)) lines.push(`L_${addr.toString(16).padStart(4, '0')}:`);
-      const op = ops[ip++];
-      const name = Op[op] || (op & 0x80 ? SystemOp[op] : null) || `DB 0x${op.toString(16)}`;
-      let line = `  ${name}`;
-      if ([Op.JMP, Op.JZ, Op.JNZ, Op.CALL].includes(op)) {
-        const target = (ops[ip] | (ops[ip + 1] << 8) | (ops[ip + 2] << 16)) - 16;
-        ip += 3; line += ` L_${target.toString(16).padStart(4, '0')}`;
-      } else if ([Op.PUSH_B, Op.MASK, Op.PASS, Op.STORE_EXT, Op.IDX].includes(op)) line += ` ${ops[ip++]}`;
-      else if ([Op.PUSH_W, Op.LD_G_B, Op.LD_G_W, Op.LD_G_D, Op.LEA_G_B, Op.LEA_G_W, Op.LEA_G_D, Op.LD_L_B, Op.LD_L_W, Op.LD_L_D, Op.LEA_L_B, Op.LEA_L_W, Op.LEA_L_D, Op.LEA_OFT, Op.LEA_L_PH, Op.LEA_ABS, Op.PUSH_ADDR, Op.SPACE, Op.LD_G_O_B, Op.LD_G_O_W, Op.LD_G_O_D, Op.LD_L_O_B, Op.LD_L_O_W, Op.LD_L_O_D].includes(op) || COMBO_IMM_OPS.has(op)) {
-        const v = ops[ip] | (ops[ip + 1] << 8); ip += 2; line += ` ${UNSIGNED_WORD_OPS.has(op) ? v : (v > 32767 ? v - 65536 : v)}`;
-      } else if (op === Op.PUSH_D) {
-        const v = ops[ip] | (ops[ip + 1] << 8) | (ops[ip + 2] << 16) | (ops[ip + 3] << 24); ip += 4; line += ` ${v}`;
-      } else if (op === Op.FUNC || op === Op.DBG || op === Op.FUNCID) { line += ` ${ops[ip] | (ops[ip + 1] << 8)} ${ops[ip + 2]}`; ip += 3; }
-      else if (op === Op.PUSH_STR) {
-        const s = ip; while (ops[ip] !== 0 && ip < ops.length) ip++; const bytes = ops.slice(s, ip); ip++;
-        line += ` "${iconv.decode(Buffer.from(bytes), 'gbk').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
-      } else if (op === Op.INIT) {
-        const a = ops[ip] | (ops[ip + 1] << 8); ip += 2; const l = ops[ip] | (ops[ip + 1] << 8); ip += 2;
-        line += ` ${a} ${l} ${Array.from(ops.slice(ip, ip + l)).join(' ')}`; ip += l;
+    try {
+      const program = LavParser.parse(lav);
+      if (program.header.version !== 0x12) {
+        return `// Invalid LAV version: 0x${program.header.version.toString(16).toUpperCase()}, expected 0x12`;
       }
-      lines.push(line);
+
+      const lines: string[] = [];
+      const jumpTargets = new Set<number>();
+      let currentStrMask = program.header.strMask;
+
+      for (const instruction of program.instructions) {
+        if (instruction.mnemonic === 'MASK' && typeof instruction.operand === 'number') {
+          currentStrMask = instruction.operand;
+        }
+        if (isJumpMnemonic(instruction.mnemonic) && typeof instruction.operand === 'number') {
+          jumpTargets.add(instruction.operand - LAV_HEADER_SIZE);
+        }
+      }
+
+      currentStrMask = program.header.strMask;
+      for (const instruction of program.instructions) {
+        const relativeOffset = instruction.offset - LAV_HEADER_SIZE;
+        if (jumpTargets.has(relativeOffset)) {
+          lines.push(`L_${relativeOffset.toString(16).padStart(4, '0')}:`);
+        }
+        lines.push(this.formatInstruction(instruction, currentStrMask));
+        if (instruction.mnemonic === 'MASK' && typeof instruction.operand === 'number') {
+          currentStrMask = instruction.operand;
+        }
+      }
+
+      return lines.join('\n');
+    } catch (error: any) {
+      return `// ${error.message}`;
     }
-    return lines.join('\n');
+  }
+
+  private formatInstruction(instruction: LavInstructionNode, currentStrMask: number): string {
+    if (instruction.mnemonic === 'DB') {
+      return `  DB 0x${instruction.opcode.toString(16).padStart(2, '0')}`;
+    }
+
+    let line = `  ${instruction.mnemonic}`;
+    switch (instruction.operandType) {
+      case OperandType.NONE:
+        return line;
+      case OperandType.U8:
+        return `${line} ${instruction.operand as number}`;
+      case OperandType.I16:
+      case OperandType.U16: {
+        const value = instruction.operand as number;
+        return `${line} ${instruction.operandType === OperandType.U16 || isUnsignedWordMnemonic(instruction.mnemonic) ? (value & 0xffff) : value}`;
+      }
+      case OperandType.U24: {
+        const target = (instruction.operand as number) - LAV_HEADER_SIZE;
+        return `${line} L_${target.toString(16).padStart(4, '0')}`;
+      }
+      case OperandType.I32:
+        return `${line} ${instruction.operand as number}`;
+      case OperandType.STRING_Z:
+        return `${line} "${formatPushString(instruction.operand as Uint8Array, currentStrMask)}"`;
+      case OperandType.INIT: {
+        const operand = instruction.operand as any;
+        return `${line} ${operand.targetAddr} ${operand.dataLength} ${Array.from(operand.data).join(' ')}`.trimEnd();
+      }
+      case OperandType.FUNC_META: {
+        const operand = instruction.operand as any;
+        return `${line} ${operand.frameSize} ${operand.argCount}`;
+      }
+    }
   }
 
   decompile(lav: Uint8Array): string {
@@ -320,6 +342,64 @@ export class LavaXDecompiler {
         }
         const parts = t.split(/\s+/), op = parts[0], args = parts.slice(1);
         
+        // Pattern 1: PUSH_*  value + PUSH_D encoded_addr + SWAP + STORE + POP (local array initialization)
+        if ((op === 'PUSH_B' || op === 'PUSH_W' || op === 'PUSH_D') && i + 4 <= end) {
+          const n1 = lines[i+1].trim().split(/\s+/);
+          const n2 = lines[i+2].trim().split(/\s+/);
+          const n3 = lines[i+3].trim().split(/\s+/);
+          
+          if ((n1[0] === 'PUSH_D' || n1[0] === 'PUSH_W') && n2[0] === 'SWAP' && n3[0] === 'STORE') {
+            const firstVal = parseInt(args[0] || '0');
+            const encodedAddr = parseInt(n1[1] || '0');
+            const hasEBP = !!(encodedAddr & 0x800000);
+            
+            if (hasEBP) {
+              const offset = encodedAddr & 0xFFFF;
+              const values: string[] = [`0x${(firstVal & 0xFF).toString(16).toUpperCase().padStart(2, '0')}`];
+              let j = i + 4; // After STORE
+              
+              // Skip POP
+              if (j <= end && lines[j].trim() === 'POP') j++;
+              
+              // Look for more values in the sequence
+              while (j + 4 <= end) {
+                const p0 = lines[j].trim().split(/\s+/);
+                const p1 = lines[j+1].trim().split(/\s+/);
+                const p2 = lines[j+2].trim().split(/\s+/);
+                const p3 = lines[j+3].trim().split(/\s+/);
+                
+                if ((p0[0] === 'PUSH_B' || p0[0] === 'PUSH_W' || p0[0] === 'PUSH_D') &&
+                    (p1[0] === 'PUSH_D' || p1[0] === 'PUSH_W') &&
+                    p2[0] === 'SWAP' &&
+                    p3[0] === 'STORE') {
+                  
+                  const val = parseInt(p0[1] || '0');
+                  const nextAddr = parseInt(p1[1] || '0');
+                  const nextOffset = nextAddr & 0xFFFF;
+                  
+                  if ((nextAddr & 0x800000) && nextOffset === offset + values.length) {
+                    values.push(`0x${(val & 0xFF).toString(16).toUpperCase().padStart(2, '0')}`);
+                    j += 4;
+                    if (j <= end && lines[j].trim() === 'POP') j++;
+                  } else {
+                    break;
+                  }
+                } else {
+                  break;
+                }
+              }
+              
+              // Mark this as an array if we found multiple values
+              if (values.length >= 2 && current) {
+                current.locals.set(offset, { size: values.length, isArray: true, data: values });
+                i = j - 1;
+                continue;
+              }
+            }
+          }
+        }
+        
+        // Pattern 2: LEA_L_ + PUSH + STORE + POP (alternative array pattern)
         if (op.startsWith('LEA_L_') && i + 3 <= end) {
             const n1 = lines[i+1].trim().split(/\s+/), n2 = lines[i+2].trim().split(/\s+/), n3 = lines[i+3].trim().split(/\s+/);
             if (n1[0].startsWith('PUSH_') && n2[0] === 'STORE' && n3[0] === 'POP') {
@@ -408,7 +488,22 @@ export class LavaXDecompiler {
           const cond = op === 'JNZ' ? `!(${rawCond})` : rawCond;
           const target = args[0], tAddr = this.labelToAddr.get(target);
           if (tAddr !== undefined) {
-              const targetLine = this.addrToLine.get(tAddr)!, pT = lines[targetLine - 1]?.trim() || "";
+              const targetLine = this.addrToLine.get(tAddr)!;
+              // Backwards jump: this is a loop-back (do-while tail or break-less while).
+              // Do NOT set i backwards — that causes infinite reprocessing.
+              // Emit a do-while or goto based on condition.
+              if (targetLine <= i) {
+                const invertCond = op === 'JNZ' ? rawCond : `!(${rawCond})`;
+                // Check if this is a trivially-true condition (while(1))
+                const stripped = stripOuterParens(invertCond);
+                if (stripped === '1' || stripped === '-1' || stripped === 'true') {
+                  bSrc += `${indent}// loop back (while 1)\n`;
+                } else {
+                  bSrc += `${indent}if (${invertCond}) goto ${target}; // do-while back\n`;
+                }
+                continue;
+              }
+              const pT = lines[targetLine - 1]?.trim() || "";
               if (pT.startsWith('JMP')) {
                   const jL = pT.split(' ')[1], ja = this.labelToAddr.get(jL);
                   if (ja !== undefined) {
@@ -518,7 +613,7 @@ export class LavaXDecompiler {
       case 'LEA_L_D': { const idx = resolveAddr(stack.pop()); stack.push(helpers.typedHandle('long', `${getAddr(parseInt(args[0]))} + ${idx}`)); break; }
       case 'LEA_OFT': if (stack.length) stack[stack.length - 1] = `(${resolveAddr(stack[stack.length - 1])} + ${args[0]})`; break;
       case 'LEA_L_PH': if (stack.length) stack[stack.length - 1] = `(${resolveAddr(stack[stack.length - 1])} + ${args[0]})`; break;
-      case 'LEA_ABS': stack.push(resolveAddr(args[0])); break;
+      case 'LEA_ABS': stack.push(getAddr(parseInt(args[0]))); break;
       case 'PUSH_ADDR': if (stack.length) stack[stack.length - 1] = `(${resolveAddr(stack[stack.length - 1])} + ${args[0]})`; break;
       case 'STORE': {
         const val = resolveAddr(stack.pop());
@@ -606,36 +701,45 @@ export class LavaXDecompiler {
       case 'L2I': stack.push(`(int)(${resolveAddr(stack.pop())})`); break;
       case 'DUP': if (stack.length) stack.push(stack[stack.length - 1]); break;
       case 'SWAP': if (stack.length >= 2) { const t = stack[stack.length-1]; stack[stack.length-1] = stack[stack.length-2]; stack[stack.length-2] = t; } break;
-      default:
-        if (SystemOp[op as any] !== undefined || op in SystemOp) {
-          const spec: any = {
-            putchar: [0], getchar: [], printf: [], sprintf: [], strcpy: [1, 1], strcat: [1, 1], strlen: [1],
-            strchr: [1, 0], strcmp: [1, 1], strstr: [1, 1], memset: [1, 0, 0], memcpy: [1, 1, 0], memmove: [1, 1, 0],
-            SetScreen: [0], UpdateLCD: [0], Delay: [0], WriteBlock: [0, 0, 0, 0, 0, 1], Refresh: [], TextOut: [0, 0, 1, 0],
-            Block: [0, 0, 0, 0, 0], Rectangle: [0, 0, 0, 0, 0], exit: [0], ClearScreen: [], abs: [0], rand: [], srand: [0],
-            Locate: [0, 0], Inkey: [], Point: [0, 0, 0], GetPoint: [0, 0], Line: [0, 0, 0, 0, 0], Box: [0, 0, 0, 0, 0, 0],
-            Circle: [0, 0, 0, 0, 0], Ellipse: [0, 0, 0, 0, 0, 0], Beep: [], isalnum: [0], isalpha: [0], iscntrl: [0],
-            isdigit: [0], isgraph: [0], islower: [0], isprint: [0], ispunct: [0], isspace: [0], isupper: [0], isxdigit: [0],
-            tolower: [0], toupper: [0], fopen: [1, 1], fclose: [0], fread: [1, 0, 0, 0], fwrite: [1, 0, 0, 0], fseek: [0, 0, 0],
-            ftell: [0], feof: [0], rewind: [0], getc: [0], putc: [0, 0], MakeDir: [1], DeleteFile: [1], Getms: [], CheckKey: [0],
-            Crc16: [1, 0], Secret: [1, 0, 1], ChDir: [1], FileList: [1], GetTime: [1], SetTime: [1], GetWord: [], XDraw: [0],
-            ReleaseKey: [0], GetBlock: [0, 0, 0, 0, 0, 1], Sin: [0], Cos: [0], FillArea: [0, 0, 0], PutKey: [0], FindWord: [0],
-            PlayInit: [0], PlayFile: [0], PlayStops: [], SetVolume: [0], PlaySleep: [], opendir: [1], readdir: [0], rewinddir: [0],
-            closedir: [0], Refresh2: [], open_key: [0], close_key: [], PlayWordVoice: [0], sysexecset: [0], open_uart: [0, 0],
-            close_uart: [], write_uart: [0, 0], read_uart: [0, 0], RefreshIcon: [], SetFgColor: [0], SetBgColor: [0], SetPalette: [0, 0, 1],
-            SetGraphMode: [0],
-          };
-          let c = 0; let argSpecs: number[] = []; if (spec[op]) { argSpecs = spec[op]; c = argSpecs.length; }
-          if (op === 'printf' || op === 'sprintf') { const countStr = stack.pop(); c = (countStr !== undefined) ? (parseInt(countStr) || 0) : 0; argSpecs = Array(c).fill(0); if (op === 'printf') argSpecs[0] = 1; else if (op === 'sprintf') { argSpecs[0] = 1; argSpecs[1] = 1; } }
-          const a: string[] = []; for (let i = 0; i < c; i++) {
-              let val = resolveAddr(stack.pop()); const argIdxFromRight = c - 1 - i;
+      default: {
+        const sys = SYSCALL_MAP[op as keyof typeof SYSCALL_MAP] || (typeof op === 'number' ? SYSCALL_OP_MAP[op] : null);
+        if (sys) {
+          let c = sys.params;
+          let argSpecs = sys.paramTypes;
+          if (sys.isVariadic) {
+              const countStr = stack.pop();
+              c = (countStr !== undefined) ? (parseInt(countStr) || 0) : 0;
+              argSpecs = Array(c).fill(0);
+              if (sys.name === 'printf') argSpecs[0] = 1;
+              else if (sys.name === 'sprintf') { argSpecs[0] = 1; argSpecs[1] = 1; }
+          }
+          const a: string[] = [];
+          for (let i = 0; i < c; i++) {
+              let val = stack.pop() || '0';
+              const argIdxFromRight = c - 1 - i;
+              
+              if (argSpecs[argIdxFromRight] === 1 && func) {
+                const rawVal = val.trim();
+                if (/^\d+$/.test(rawVal)) {
+                  const offset = parseInt(rawVal);
+                  for (const [start, info] of func.locals.entries()) {
+                    if (info.isArray && start === offset) {
+                      val = `l_${start}`;
+                      break;
+                    }
+                  }
+                }
+              }
+              
+              val = resolveAddr(val);
               if (argSpecs[argIdxFromRight] === 1) val = resolveAddr(val);
               a.unshift(val);
           }
-          const call = `${op}(${a.join(', ')})`;
-          const returns = ['getchar', 'strlen', 'abs', 'rand', 'Inkey', 'GetPoint', 'isalnum', 'isalpha', 'iscntrl', 'isdigit', 'isgraph', 'islower', 'isprint', 'ispunct', 'isspace', 'isupper', 'isxdigit', 'strchr', 'strcmp', 'strstr', 'tolower', 'toupper', 'fopen', 'fread', 'fwrite', 'fseek', 'ftell', 'feof', 'getc', 'putc', 'MakeDir', 'DeleteFile', 'Getms', 'CheckKey', 'Crc16', 'ChDir', 'FileList', 'GetWord', 'Sin', 'Cos', 'FindWord', 'PlayInit', 'PlayFile', 'opendir', 'readdir', 'closedir', 'read_uart', 'srand', 'GetBlock'];
-          if (returns.includes(op)) stack.push(call); else emit(call);
+          const call = `${sys.name}(${a.join(', ')})`;
+          if (sys.hasReturn) stack.push(call); else emit(call);
         }
+        break;
+      }
     }
   }
 }

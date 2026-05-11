@@ -132,7 +132,30 @@ export function App() {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [showExamples, setShowExamples] = useState(false);
 
-  const { running, logs, screen, compile, run, stop, pushKey, releaseKey, vm, compiler, assembler, setLogs, clearLogs } = useLavaVM(() => { });
+  const handleVmLog = useCallback((msg: string) => {
+    // Optionally handle logs here if needed by index.tsx specifically
+  }, []);
+
+  const {
+    running,
+    canAcceptInput,
+    canResume,
+    lifecycleState,
+    pauseDiagnostics,
+    logs,
+    screen,
+    compile,
+    run,
+    stop,
+    resume,
+    pushKey,
+    releaseKey,
+    vm,
+    compiler,
+    assembler,
+    setLogs,
+    clearLogs
+  } = useLavaVM(handleVmLog);
   const decompiler = useMemo(() => new LavaXDecompiler(), []);
 
   const activeTab = useMemo(() => tabs.find(t => t.id === activeTabId) || tabs[0], [tabs, activeTabId]);
@@ -175,6 +198,27 @@ export function App() {
     setActiveTabId(id);
   }, [tabs]);
 
+  const handleGotoLocation = useCallback((file: string, line: number, col: number) => {
+    if (file) {
+      // Try to find an already-open tab with that name
+      const existing = tabs.find(t => t.name === file);
+      if (existing) {
+        setActiveTabId(existing.id);
+      } else {
+        // Try to open from VFS
+        const data = vm.vfs.getFile(file);
+        if (data) {
+          const textContent = iconv.decode(Buffer.from(data), 'gbk');
+          const id = Math.random().toString(36).substr(2, 9);
+          setTabs(prev => [...prev, { id, name: file, content: textContent }]);
+          setActiveTabId(id);
+        }
+      }
+    }
+    setViewMode('editor');
+    setEditorGotoLine({ line, col });
+  }, [tabs, vm]);
+
   const saveToVFS = useCallback(() => {
     if (!activeTab) return;
     const gbkData = iconv.encode(activeTab.content, 'gbk');
@@ -188,8 +232,30 @@ export function App() {
   const [rightTab, setRightTab] = useState<'emulator' | 'files'>('emulator');
   const [debugMode, setDebugMode] = useState(false);
   const [mobileView, setMobileView] = useState<'editor' | 'emulator' | 'files'>('editor');
+  const [editorGotoLine, setEditorGotoLine] = useState<{line: number; col: number} | null>(null);
   const { t, language, setLanguage } = useI18n();
   const [showLangMenu, setShowLangMenu] = useState(false);
+
+  const vmStatusLabel = useMemo(() => {
+    switch (lifecycleState) {
+      case 'running':
+        return t('systemRunning');
+      case 'waiting':
+        return t('systemWaiting');
+      case 'paused':
+        return t('systemPaused');
+      case 'faulted':
+        return t('systemFaulted');
+      case 'stopped':
+        return t('systemStopped');
+      default:
+        return t('systemIdle');
+    }
+  }, [lifecycleState, t]);
+
+  const handleResume = useCallback(() => {
+    void resume();
+  }, [resume]);
 
   const switchMobileView = (view: 'editor' | 'emulator' | 'files') => {
     setMobileView(view);
@@ -235,8 +301,10 @@ export function App() {
 
 
   const build = useCallback(() => {
-    const res = compile(code);
-    const fileName = activeTab?.name.replace(/\.c$/, '') || 'program';
+    const tabName = activeTab?.name || '';
+    const sourceDir = tabName.includes('/') ? tabName.slice(0, tabName.lastIndexOf('/')) : undefined;
+    const res = compile(code, sourceDir, tabName || undefined);
+    const fileName = tabName.replace(/\.c$/, '') || 'program';
     if (res.bin) {
       setTabs(prev => prev.map(t => t.id === activeTabId ? { ...t, asm: res.asm, bin: res.bin! } : t));
 
@@ -353,7 +421,23 @@ export function App() {
 
         {/* Run/Stop + Debug + Language */}
         <div className="flex items-center gap-2">
-          {!running ? (
+          {lifecycleState === 'paused' ? (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleResume}
+                disabled={!canResume}
+                className="flex items-center gap-1.5 px-4 md:px-6 py-2 bg-emerald-500 text-black rounded-xl font-bold hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed active:scale-95 transition-all shadow-lg shadow-emerald-500/20 group text-sm md:text-base"
+              >
+                <Play className="w-3.5 h-3.5 md:w-4 md:h-4 fill-current group-hover:scale-110 transition-transform" /> {t('resume')}
+              </button>
+              <button
+                onClick={stop}
+                className="flex items-center gap-1.5 px-4 md:px-6 py-2 bg-red-500 text-white rounded-xl font-bold hover:bg-red-600 active:scale-95 transition-all shadow-lg shadow-red-500/20 text-sm md:text-base"
+              >
+                <Square className="w-3.5 h-3.5 md:w-4 md:h-4 fill-current animate-pulse" /> {t('stop')}
+              </button>
+            </div>
+          ) : !running ? (
             <button
               onClick={handleRun}
               className="flex items-center gap-1.5 px-4 md:px-6 py-2 bg-white text-black rounded-xl font-bold hover:bg-slate-200 active:scale-95 transition-all shadow-lg shadow-white/10 group text-sm md:text-base"
@@ -547,6 +631,7 @@ export function App() {
                 code={code}
                 onChange={setCode}
                 onScroll={handleEditorScroll}
+                gotoLine={editorGotoLine}
               />
             )}
             {viewMode === 'asm' && (
@@ -590,7 +675,7 @@ export function App() {
               </button>
             </div>
             <div className="flex-1 overflow-hidden flex flex-col">
-              <LavaTerminal logs={terminalLogs} onClear={clearLogs} onLog={(msg) => setLogs(p => [...p, msg])} />
+              <LavaTerminal logs={terminalLogs} onClear={clearLogs} onLog={(msg) => setLogs(p => [...p, msg])} onGotoLocation={handleGotoLocation} />
             </div>
           </div>
         </div>
@@ -614,15 +699,20 @@ export function App() {
                 onKeyPress={pushKey}
                 onKeyRelease={releaseKey}
                 onStop={stop}
+                onResume={handleResume}
                 isRunning={running}
+                canResume={canResume}
+                canAcceptInput={canAcceptInput}
+                lifecycleState={lifecycleState}
+                pauseDiagnostics={pauseDiagnostics}
               />
             ) : (
               <FileManager
                 vm={vm}
-                onRunLav={async (data) => {
+                onRunLav={async (path, data) => {
                   setTabs(prev => prev.map(t => t.id === activeTabId ? { ...t, bin: data } : t));
                   switchMobileView('emulator');
-                  await run(data);
+                  await run(data, path);
                 }}
                 onDecompileLav={handleDecompile}
                 onOpenFile={(path, content) => {
@@ -639,11 +729,14 @@ export function App() {
       <footer className="hidden md:flex h-10 border-t border-white/5 bg-black/80 px-8 items-center justify-between text-[10px] text-slate-500 font-mono tracking-wider">
         <div className="flex gap-8">
           <div className="flex items-center gap-2">
-            <div className={`w-1.5 h-1.5 rounded-full ${running ? 'bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-neutral-700'}`}></div>
-            {running ? t('systemRunning') : t('systemIdle')}
+            <div className={`w-1.5 h-1.5 rounded-full ${lifecycleState === 'running' ? 'bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]' : lifecycleState === 'waiting' ? 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)]' : lifecycleState === 'paused' ? 'bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.6)]' : lifecycleState === 'faulted' ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]' : 'bg-neutral-700'}`}></div>
+            {vmStatusLabel}
           </div>
           <div>{t('lenLabel')}: {code.split('\n').length}</div>
           <div>{t('modeLabel')}: {debugMode ? t('modeDebug') : t('modeProd')}</div>
+          {(pauseDiagnostics?.message || lifecycleState === 'paused' || lifecycleState === 'faulted') && (
+            <div className="max-w-[28rem] truncate">{pauseDiagnostics?.message || vmStatusLabel}</div>
+          )}
         </div>
         <div className="flex gap-6">
           <div className="flex items-center gap-1.5"><Monitor size={12} /> 160x80 MONO</div>

@@ -24,3 +24,6 @@ dist-ssr
 *.sw?
 
 docs/ref_prjs
+.omx/
+
+tmp/

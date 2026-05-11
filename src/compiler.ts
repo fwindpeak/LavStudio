@@ -1,6 +1,7 @@
 import { SystemOp } from './types';
 import iconv from 'iconv-lite';
 import { LavaXAssembler } from './compiler/LavaXAssembler';
+import { SYSCALL_MAP } from './vm/SyscallMetadata';
 
 function encodeToGBK(str: string): number[] {
   try {
@@ -42,6 +43,140 @@ interface StructDef {
 }
 
 export class LavaXCompiler {
+  /** Optional resolver for #include directives. Return file content as string, or null if not found. */
+  public includeResolver: ((filename: string) => string | null) | null = null;
+
+  /**
+   * Full C preprocessor: handles #define, #undef, #include, #ifdef, #ifndef,
+   * #if, #elif, #else, #endif. Preserves line count for error reporting.
+   * sharedDefines is used for recursive #include so macros defined in the
+   * parent file are visible inside included files.
+   */
+  private runPreprocessor(source: string, filename: string = '', visited: Set<string> = new Set(), sharedDefines?: Map<string, string>): string {
+    const defines: Map<string, string> = sharedDefines ?? new Map([
+      ['NULL', '0'], ['TRUE', '1'], ['FALSE', '0']
+    ]);
+    // Normalize line endings before splitting so CRLF files work correctly
+    const normalized = source.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = normalized.split('\n');
+    const outputLines: string[] = [];
+    // Stack: {parentEmitting, seenTrue} — "seenTrue" means a true branch was already taken
+    const stack: Array<{parentEmitting: boolean, seenTrue: boolean}> = [];
+    let emitting = true;
+
+    const evalBool = (expr: string): boolean => {
+      let expanded = expr
+        .replace(/\bdefined\s*\(\s*(\w+)\s*\)/g, (_, n: string) => defines.has(n) ? '1' : '0')
+        .replace(/\bdefined\s+(\w+)/g, (_, n: string) => defines.has(n) ? '1' : '0');
+      let limit = 20;
+      while (limit-- > 0) {
+        let changed = false;
+        expanded = expanded.replace(/\b([a-zA-Z_]\w*)\b/g, (m) => {
+          if (defines.has(m)) { changed = true; return defines.get(m)!; }
+          return m;
+        });
+        if (!changed) break;
+      }
+      try { return !!new Function(`return (${expanded});`)(); } catch { return false; }
+    };
+
+    // Push one output line and its source-map entry together
+    const pushLine = (text: string, origLine: number) => {
+      outputLines.push(text);
+      this.preprocessorMap.push({ file: filename, line: origLine });
+    };
+
+    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+      const line = lines[lineIdx];
+      const origLine = lineIdx + 1; // 1-based
+      const trimmed = line.trimStart();
+      if (trimmed.startsWith('#')) {
+        const rest = trimmed.slice(1).replace(/^\s*/, '');
+        // Use [^\r\n]* so the match stops at CR/LF regardless of normalization artifacts
+        const dm = rest.match(/^(\w+)(?:[ \t]+([^\r\n]*))?/);
+        if (!dm) { pushLine(emitting ? line : '', origLine); continue; }
+        const directive = dm[1];
+        const arg = (dm[2] || '').trim();
+
+        if (directive === 'ifdef') {
+          const cond = emitting && defines.has(arg);
+          stack.push({ parentEmitting: emitting, seenTrue: cond });
+          emitting = cond;
+          pushLine('', origLine);
+        } else if (directive === 'ifndef') {
+          const cond = emitting && !defines.has(arg);
+          stack.push({ parentEmitting: emitting, seenTrue: cond });
+          emitting = cond;
+          pushLine('', origLine);
+        } else if (directive === 'if') {
+          const cond = emitting && evalBool(arg);
+          stack.push({ parentEmitting: emitting, seenTrue: cond });
+          emitting = cond;
+          pushLine('', origLine);
+        } else if (directive === 'elif') {
+          const frame = stack[stack.length - 1];
+          if (frame) {
+            const cond = frame.parentEmitting && !frame.seenTrue && evalBool(arg);
+            if (cond) frame.seenTrue = true;
+            emitting = cond;
+          }
+          pushLine('', origLine);
+        } else if (directive === 'else') {
+          const frame = stack[stack.length - 1];
+          if (frame) emitting = frame.parentEmitting && !frame.seenTrue;
+          pushLine('', origLine);
+        } else if (directive === 'endif') {
+          const frame = stack.pop();
+          emitting = frame?.parentEmitting ?? true;
+          pushLine('', origLine);
+        } else if (emitting && directive === 'define') {
+          const defm = arg.match(/^(\w+)(?:\s+(.*))?$/);
+          if (defm) {
+            let val = defm[2] || '';
+            const ci = val.indexOf('//');
+            if (ci !== -1) val = val.substring(0, ci);
+            defines.set(defm[1], val.trim());
+          }
+          pushLine(line, origLine); // keep so pre-scan also picks it up
+        } else if (emitting && directive === 'undef') {
+          defines.delete(arg);
+          pushLine('', origLine);
+        } else if (emitting && directive === 'include') {
+          const inclm = arg.match(/^"([^"]+)"/);
+          if (inclm) {
+            const incFilename = inclm[1];
+            if (!this.includeResolver) {
+              pushLine(`// #include "${incFilename}" (no resolver)`, origLine);
+            } else if (visited.has(incFilename)) {
+              pushLine(`// #include "${incFilename}" (circular, skipped)`, origLine);
+            } else {
+              const content = this.includeResolver(incFilename);
+              if (content === null) {
+                pushLine(`// #include "${incFilename}" (not found)`, origLine);
+              } else {
+                visited.add(incFilename);
+                // Recursive call appends to this.preprocessorMap directly as a side effect.
+                // We spread the expanded lines individually so outputLines and preprocessorMap stay 1:1.
+                const expanded = this.runPreprocessor(content, incFilename, visited, defines);
+                outputLines.push(...expanded.split('\n'));
+                // Note: map entries for included lines were already appended by the recursive call
+                visited.delete(incFilename);
+              }
+            }
+          } else {
+            pushLine('', origLine); // <system> includes — skip
+          }
+        } else {
+          pushLine(emitting ? line : '', origLine);
+        }
+      } else {
+        pushLine(emitting ? line : '', origLine);
+      }
+    }
+
+    return outputLines.join('\n');
+  }
+
   // Ensure source is interpreted as GBK: encode -> decode via GBK to coerce codepoints
   private normalizeSourceToGBK(source: string): string {
     try {
@@ -65,42 +200,8 @@ export class LavaXCompiler {
   private defines: Map<string, string> = new Map();
   private initializers: string[] = [];
   private structs: Map<string, StructDef> = new Map();
-  private readonly SYSCALLS_WITH_RETURN = new Set([
-    'getchar', 'strlen', 'abs', 'rand', 'Inkey', 'GetPoint',
-    'isalnum', 'isalpha', 'iscntrl', 'isdigit', 'isgraph',
-    'islower', 'isprint', 'ispunct', 'isspace', 'isupper', 'isxdigit',
-    'strchr', 'strcmp', 'strstr', 'tolower', 'toupper',
-    'fopen', 'fread', 'fwrite', 'fseek', 'ftell', 'feof',
-    'getc', 'putc', 'MakeDir', 'DeleteFile', 'Getms', 'CheckKey', 'Crc16',
-    'ChDir', 'FileList', 'GetWord', 'Sin', 'Cos',
-    'FindWord', 'PlayInit', 'PlayFile',
-    'opendir', 'readdir', 'closedir', 'read_uart', 'SetFgColor', 'SetBgColor', 'SetPalette',
-    'SetGraphMode'
-  ]);
-
-
-  private static readonly SYSCALL_PARAM_COUNTS: Partial<Record<keyof typeof SystemOp, number>> = {
-    putchar: 1, getchar: 0, strcpy: 2, strlen: 1, SetScreen: 1,
-    UpdateLCD: 1, Delay: 1, WriteBlock: 6, Refresh: 0, TextOut: 4,
-    Block: 5, Rectangle: 5, exit: 1, ClearScreen: 0, abs: 1,
-    rand: 0, srand: 1, Locate: 2, Inkey: 0, Point: 3,
-    GetPoint: 2, Line: 5, Box: 6, Circle: 5, Ellipse: 6,
-    Beep: 0, isalnum: 1, isalpha: 1, iscntrl: 1, isdigit: 1,
-    isgraph: 1, islower: 1, isprint: 1, ispunct: 1, isspace: 1,
-    isupper: 1, isxdigit: 1, strcat: 2, strchr: 2, strcmp: 2,
-    strstr: 2, tolower: 1, toupper: 1, memset: 3, memcpy: 3,
-    fopen: 2, fclose: 1, fread: 4, fwrite: 4, fseek: 3,
-    ftell: 1, feof: 1, rewind: 1, getc: 1, putc: 2,
-    MakeDir: 1, DeleteFile: 1, Getms: 0, CheckKey: 1, memmove: 3,
-    Crc16: 2, Secret: 3, ChDir: 1, FileList: 1, GetTime: 1,
-    SetTime: 1, GetWord: 0, XDraw: 1, ReleaseKey: 0, GetBlock: 6,
-    Sin: 1, Cos: 1, FillArea: 3, PutKey: 1, FindWord: 1,
-    PlayInit: 1, PlayFile: 1, PlayStops: 0, SetVolume: 1, PlaySleep: 0,
-    opendir: 1, readdir: 1, rewinddir: 1, closedir: 1, Refresh2: 0,
-    open_key: 1, close_key: 0, PlayWordVoice: 1, sysexecset: 1, open_uart: 2,
-    close_uart: 0, write_uart: 2, read_uart: 2, RefreshIcon: 0,
-    SetFgColor: 1, SetBgColor: 1, SetPalette: 3, SetGraphMode: 1
-  };
+  /** Maps each line (0-based) in the preprocessed source to its original file/line. */
+  private preprocessorMap: Array<{file: string; line: number}> = [];
 
   private getTypeSize(type: string): number {
     if (type === 'char') return 1;
@@ -254,11 +355,22 @@ export class LavaXCompiler {
     }
   }
 
-  private getLineNumber(pos: number): number {
-    return this.src.substring(0, pos).split('\n').length;
+  private getLineInfo(pos: number): {file: string; line: number; col: number} {
+    const before = this.src.substring(0, pos);
+    const linesBefore = before.split('\n');
+    const lineIdx = linesBefore.length - 1; // 0-based index into expanded source
+    const col = linesBefore[lineIdx].length + 1;
+    if (lineIdx < this.preprocessorMap.length) {
+      const entry = this.preprocessorMap[lineIdx];
+      return {file: entry.file, line: entry.line, col};
+    }
+    return {file: '', line: lineIdx + 1, col};
   }
 
-  compile(source: string | Buffer): string {
+  private _compileFilename: string = '';
+
+  compile(source: string | Buffer, filename: string = ''): string {
+    this._compileFilename = filename;
     // Accept either a string or a Buffer. If Buffer, detect encoding.
     if (Buffer.isBuffer(source)) {
       const buf: Buffer = source as Buffer;
@@ -278,6 +390,9 @@ export class LavaXCompiler {
       // source is string
       this.src = this.normalizeSourceToGBK(source as string);
     }
+    // Expand preprocessor directives (#include, #ifdef, #define, etc.)
+    this.preprocessorMap = [];
+    this.src = this.runPreprocessor(this.src, this._compileFilename);
     this.pos = 0;
     this.asm = [];
     this.labelCount = 0;
@@ -325,6 +440,18 @@ export class LavaXCompiler {
         }
 
         if (!type || !['int', 'char', 'long', 'void', 'addr', 'struct', 'typedef'].includes(type)) {
+          // Skip extern declarations entirely (forward decls - actual definition is elsewhere)
+          if (type === 'extern') {
+            this.parseToken();
+            while (this.pos < this.src.length && this.src[this.pos] !== ';' && this.src[this.pos] !== '\n') this.pos++;
+            if (this.pos < this.src.length && this.src[this.pos] === ';') this.pos++;
+            continue;
+          }
+          // Skip modifier keywords - re-loop to process the actual type
+          if (type === 'const' || type === 'static' || type === 'unsigned' || type === 'signed') {
+            this.parseToken();
+            continue;
+          }
           if (type) this.parseToken(); // Consume unknown top-level or whatever
           continue;
         }
@@ -503,8 +630,16 @@ export class LavaXCompiler {
                   this.initializers.push(`INIT ${this.globalOffset} ${byteValues.length} ${byteValues.join(' ')}`);
                 }
               } else {
-                const expr = this.parseToken(); // Simplified for pre-scan
-                const val = this.evalConstant(expr);
+                const firstTok = this.parseToken();
+                let val: number;
+                if (firstTok === '&') {
+                  // &globalVar — compile-time constant: address of a global variable
+                  const varName = this.parseToken();
+                  const gvar = this.globals.get(varName);
+                  val = gvar !== undefined ? gvar.offset : NaN;
+                } else {
+                  val = this.evalConstant(firstTok);
+                }
                 if (!isNaN(val)) {
                   if (elementSize === 1) this.initializers.push(`INIT ${this.globalOffset} 1 ${val & 0xFF}`);
                   else if (elementSize === 2) this.initializers.push(`INIT ${this.globalOffset} 2 ${val & 0xFF} ${(val >> 8) & 0xFF}`);
@@ -535,20 +670,17 @@ export class LavaXCompiler {
         this.parseTopLevel();
       }
     } catch (e: any) {
-      // Calculate line and column number
-      const lines = this.src.substring(0, this.pos).split('\n');
-      const lineNumber = lines.length;
-      const columnNumber = lines[lines.length - 1].length + 1;
-
+      const info = this.getLineInfo(this.pos);
+      const locationStr = `${info.file || 'source'}:${info.line}:${info.col}`;
       const contextStart = Math.max(0, this.pos - 20);
       const contextEnd = Math.min(this.src.length, this.pos + 30);
       const context = this.src.substring(contextStart, contextEnd);
       const pointer = ' '.repeat(this.pos - contextStart) + '^';
       console.error('[COMPILER ERROR]', e.message);
-      console.error(`At line ${lineNumber}, column ${columnNumber} `);
+      console.error(`At ${locationStr}`);
       console.error('Context:', context);
       console.error('        ', pointer);
-      return `ERROR: ${e.message} at line ${lineNumber}, column ${columnNumber} \nContext: ${context} \n         ${pointer} `;
+      return `ERROR: ${e.message} at ${locationStr}\nContext: ${context}\n         ${pointer}`;
     }
     this.peepholeOptimize();
     return this.asm.join('\n');
@@ -669,8 +801,19 @@ export class LavaXCompiler {
   }
 
   private parseTopLevel() {
-    const type = this.parseToken();
+    let type = this.parseToken();
     if (!type) return;
+
+    // Skip modifier keywords, consuming them before the actual type
+    while (type === 'extern' || type === 'const' || type === 'static' || type === 'unsigned' || type === 'signed') {
+      if (type === 'extern') {
+        // extern is a forward declaration — skip the whole statement
+        while (this.pos < this.src.length && this.src[this.pos] !== ';' && this.src[this.pos] !== '\n') this.pos++;
+        if (this.pos < this.src.length && this.src[this.pos] === ';') this.pos++;
+        return;
+      }
+      type = this.parseToken();
+    }
 
     // Handle struct definition (already pre-scanned, skip the body)
     if (type === 'struct') {
@@ -813,6 +956,12 @@ export class LavaXCompiler {
     const token = this.peekToken();
     if (!token) return;
 
+    // Empty statement: just a semicolon (e.g. while(cond); or standalone ;)
+    if (token === ';') {
+      this.parseToken();
+      return;
+    }
+
     if (token.endsWith(':')) {
       this.parseToken();
       this.asm.push(token);
@@ -837,6 +986,12 @@ export class LavaXCompiler {
         this.localOffset += structDef.totalSize;
       } while (this.match(','));
       this.expect(';');
+      return;
+    }
+
+    if (token === 'const' || token === 'static') {
+      this.parseToken(); // consume modifier, then re-parse as a regular statement
+      this.parseStatement();
       return;
     }
 
@@ -963,29 +1118,29 @@ export class LavaXCompiler {
           const addr = this.localOffset;
           this.localOffset += size * elementSize;
 
-            // Parse the value expression first
-            this.parseExpression();
-            // Then get address for the destination variable
-            // For pointer variables (pointerDepth > 0), they store a full handle (24-bit),
-            // so we treat them as DWORD (4-byte) storage.
-            // We use PUSH_W + PUSH_D 0x800000 + OR to avoid pre-baked type bits from LEA.
-            if (pointerDepth > 0) {
-              // Pointer variable: store as DWORD (handle is 24-bit)
-              this.asm.push(`PUSH_W ${addr}`);
-              this.asm.push('PUSH_D 0x800000');
-              this.asm.push('OR');
-              this.asm.push('PUSH_D 0x40000');
-              this.asm.push('OR');
-            } else {
-              // Normal variable: use pre-computed handle
-              let handleType = 0x10000;
-              if (token === 'int') handleType = 0x20000;
-              else if (token === 'long' || token === 'addr') handleType = 0x40000;
-              this.asm.push(`PUSH_D ${addr | handleType | 0x800000}`);
-            }
-            this.asm.push('SWAP');
-            this.asm.push('STORE');
-            this.asm.push('POP');
+          // Parse the value expression first
+          this.parseExpression();
+          // Then get address for the destination variable
+          // For pointer variables (pointerDepth > 0), they store a full handle (24-bit),
+          // so we treat them as DWORD (4-byte) storage.
+          // We use PUSH_W + PUSH_D 0x800000 + OR to avoid pre-baked type bits from LEA.
+          if (pointerDepth > 0) {
+            // Pointer variable: store as DWORD (handle is 24-bit)
+            this.asm.push(`PUSH_W ${addr}`);
+            this.asm.push('PUSH_D 0x800000');
+            this.asm.push('OR');
+            this.asm.push('PUSH_D 0x40000');
+            this.asm.push('OR');
+          } else {
+            // Normal variable: use pre-computed handle
+            let handleType = 0x10000;
+            if (token === 'int') handleType = 0x20000;
+            else if (token === 'long' || token === 'addr') handleType = 0x40000;
+            this.asm.push(`PUSH_D ${addr | handleType | 0x800000}`);
+          }
+          this.asm.push('SWAP');
+          this.asm.push('STORE');
+          this.asm.push('POP');
         } else {
           if (size === 0) throw new Error(`Array size required for ${name}`);
           this.locals.set(name, { offset: this.localOffset, type: token, size, pointerDepth });
@@ -1230,6 +1385,41 @@ export class LavaXCompiler {
   private parseAssignment(): boolean {
     const token = this.peekToken();
 
+    // Support (type *)ptr = value  (LavaX pointer-cast lvalue)
+    const savedPosCast = this.pos;
+    const savedAsmLenCast = this.asm.length;
+    if (this.match('(')) {
+      const castType = this.parseToken();
+      if (['int', 'char', 'long', 'float', 'addr'].includes(castType)) {
+        let pDepth = 0;
+        while (this.match('*')) pDepth++;
+        if (pDepth > 0 && this.match(')')) {
+          this.parseUnary(); // parse the pointer expression onto the stack
+          const castOp = this.peekToken();
+          const isCastCompound = castOp.endsWith('=') && castOp.length > 1 && !['==', '!=', '<=', '>='].includes(castOp);
+          if (castOp === '=' || isCastCompound) {
+            this.parseToken(); // consume =
+            // CPTR/CIPTR/CLPTR strips upper bits and sets the cast type.
+            if (castType === 'char') this.asm.push('CPTR');
+            else if (castType === 'int') this.asm.push('CIPTR');
+            else this.asm.push('CLPTR'); // long, addr, float
+            if (isCastCompound) {
+              this.asm.push('DUP');
+              this.asm.push('LD_IND');
+              this.parseExpression();
+              this.emitCompoundOp(castOp);
+            } else {
+              this.parseExpression();
+            }
+            this.asm.push('STORE');
+            return true;
+          }
+        }
+      }
+      this.pos = savedPosCast;
+      this.asm.length = savedAsmLenCast;
+    }
+
     // Support *ptr = value
     const savedPos = this.pos;
     const savedAsmLen = this.asm.length;
@@ -1250,8 +1440,10 @@ export class LavaXCompiler {
         const isCompound = op.endsWith('=') && op.length > 1 && !['==', '!=', '<=', '>='].includes(op);
         if (op === '=' || isCompound) {
           this.parseToken(); // consume op
-          this.asm.push(`PUSH_D ${handleType}`);
-          this.asm.push('OR'); // Stack: [..., handle]
+          // Apply type via CPTR/CIPTR/CLPTR (strips upper bits, sets type).
+          if (handleType === '0x10000') this.asm.push('CPTR');
+          else if (handleType === '0x20000') this.asm.push('CIPTR');
+          else this.asm.push('CLPTR');
           if (isCompound) {
             this.asm.push('DUP');
             this.asm.push('LD_IND');
@@ -1385,7 +1577,7 @@ export class LavaXCompiler {
         const isCompound = op.endsWith('=') && op.length > 1 && !['==', '!=', '<=', '>='].includes(op);
         if (op === '=' || isCompound) {
           this.parseToken(); // consume op
-          
+
           // For compound assignment (e.g., i = i + 1):
           // We need to evaluate the right side expression first, then store
           // The correct order is:
@@ -1393,7 +1585,7 @@ export class LavaXCompiler {
           // 2. Get address
           // 3. SWAP to get [value, addr]
           // 4. STORE
-          
+
           const opPrefix = isLocal ? 'LEA_L' : 'LEA_G';
           // Pointer variables store a 24-bit handle (4 bytes), must use D suffix
           const opSuffix = (variable as any).pointerDepth > 0 ? 'D' :
@@ -1406,7 +1598,7 @@ export class LavaXCompiler {
           } else {
             this.parseAssignment();
           }
-          
+
           // Now get the address and prepare for store
           // Use pre-computed handle (offset | type | baseFlags)
           this.emitVarHandle(variable, isLocal);
@@ -1556,20 +1748,24 @@ export class LavaXCompiler {
       } else {
         throw new Error(`-- requires lvalue, got ${token} `);
       }
+    } else if (this.match('+')) {
+      // Unary plus: just parse the expression (no code generation needed)
+      this.parseUnary();
+      return true;
     } else if (this.match('(')) {
       const savedPos = this.pos;
       const token = this.parseToken();
-      if (['int', 'char', 'long', 'void', 'addr'].includes(token)) {
+      if (['int', 'char', 'long', 'void', 'addr', 'float'].includes(token)) {
         let pointerDepth = 0;
         while (this.match('*')) { pointerDepth++; }
         this.expect(')');
         this.parseUnary();
         if (pointerDepth > 0) {
-          let handleType = '0x10000';
-          if (token === 'int') handleType = '0x20000';
-          else if (token === 'long' || token === 'addr') handleType = '0x40000';
-          this.asm.push(`PUSH_D ${handleType}`);
-          this.asm.push('OR');
+          // LavaX (type *) reads from the address stored in the expression.
+          // CPTR/CIPTR/CLPTR strips upper bits and sets correct type, then LD_IND reads.
+          if (token === 'char') this.asm.push('CPTR');
+          else if (token === 'int') this.asm.push('CIPTR');
+          else this.asm.push('CLPTR'); // long, addr, float
           this.asm.push('LD_IND');
           return true;
         }
@@ -1590,18 +1786,15 @@ export class LavaXCompiler {
       // We should NOT OR additional type bits - just call LD_IND directly.
       // If the pointer came from an expression (not a direct variable), we may need type bits.
       if (variable && (variable as any).pointerDepth > 0) {
-        // The handle already has correct type bits encoded when the pointer was created via &
-        // Just dereference directly
-        this.asm.push('LD_IND');
+        // C-style typed pointer: apply the declared element type, then LD_IND.
+        if (variable.type === 'int') this.asm.push('CIPTR');
+        else if (variable.type === 'long' || variable.type === 'addr') this.asm.push('CLPTR');
+        else this.asm.push('CPTR'); // char
       } else {
-        // Fallback: pointer came from a complex expression, add type bits
-        let handleType = '0x10000';
-        if (variable && variable.type === 'int') handleType = '0x20000';
-        else if (variable && (variable.type === 'long' || variable.type === 'addr')) handleType = '0x40000';
-        this.asm.push(`PUSH_D ${handleType}`);
-        this.asm.push('OR');
-        this.asm.push('LD_IND');
+        // LavaX-style: * is shorthand for (char *) - always read 1 byte.
+        this.asm.push('CPTR');
       }
+      this.asm.push('LD_IND');
       return true;
     } else if (this.match('&')) {
       const token = this.peekToken();
@@ -1631,16 +1824,14 @@ export class LavaXCompiler {
           this.asm.push(`PUSH_D ${ptrHandleType}`);
           this.asm.push('OR');
         } else {
-          // For &variable, push the offset with EBP flag (for local) plus type bits
-          // so that pointer dereference (LD_IND) reads/writes the correct width.
-          this.asm.push(`PUSH_W ${variable.offset}`);
+          // For &variable, produce an absolute (not EBP-relative) raw address.
+          // Type bits are applied at the dereference site (CPTR/CIPTR/CLPTR), so no
+          // need to embed them here. This also avoids spurious globals in the decompiler.
           if (isLocal) {
-            this.asm.push('PUSH_D 0x800000');
-            this.asm.push('OR');
+            this.asm.push(`LEA_ABS ${variable.offset}`);
+          } else {
+            this.asm.push(`PUSH_W ${variable.offset}`);
           }
-          // Add type bits
-          this.asm.push(`PUSH_D ${ptrHandleType}`);
-          this.asm.push('OR');
         }
         return true;
       } else {
@@ -1725,9 +1916,10 @@ export class LavaXCompiler {
         this.asm.push(`PUSH_B ${args.length}`);
       }
 
-      if (SystemOp[token as keyof typeof SystemOp] !== undefined) {
-        const expectedCount = LavaXCompiler.SYSCALL_PARAM_COUNTS[token as keyof typeof SystemOp];
-        if (expectedCount !== undefined && args.length !== expectedCount) {
+      if (SYSCALL_MAP[token]) {
+        const sys = SYSCALL_MAP[token];
+        const expectedCount = sys.params;
+        if (!sys.isVariadic && args.length !== expectedCount) {
           throw new Error(`Function ${token} expects ${expectedCount} arguments, but got ${args.length}`);
         }
         if (token === 'printf' && args.length < 1) {
@@ -1737,7 +1929,11 @@ export class LavaXCompiler {
           throw new Error(`sprintf expects at least 2 arguments`);
         }
         this.asm.push(`${token}`);
-        return this.SYSCALLS_WITH_RETURN.has(token);
+        return sys.hasReturn;
+      } else if (SystemOp[token as keyof typeof SystemOp] !== undefined) {
+        // Fallback for syscalls not in map
+        this.asm.push(`${token}`);
+        return true;
       } else {
         if (func && args.length !== func.params) {
           throw new Error(`Function ${token} expects ${func.params} arguments, but got ${args.length}`);

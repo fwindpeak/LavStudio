@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { useI18n } from '../i18n';
 
@@ -6,17 +6,30 @@ interface EditorProps {
     code: string;
     onChange: (code: string) => void;
     language?: string; // 支持 c, cpp, javascript, python 等
+    gotoLine?: {line: number; col: number} | null;
+    onScroll?: (e: React.UIEvent<HTMLTextAreaElement>) => void;
 }
 
-export const CodeEditor: React.FC<EditorProps> = ({ 
-    code, 
-    onChange, 
-    language = 'c' // 默认设为 C 语言（根据你之前的关键字推断）
+export const CodeEditor: React.FC<EditorProps> = ({
+    code,
+    onChange,
+    language = 'c', // 默认设为 C 语言（根据你之前的关键字推断）
+    gotoLine,
 }) => {
     const { t } = useI18n();
     const monaco = useMonaco();
     const editorRef = useRef<any>(null);
     const [cursorPosition, setCursorPosition] = useState({ line: 1, column: 1 });
+
+    // Navigate editor to the requested line/col when gotoLine changes
+    useEffect(() => {
+        if (gotoLine && editorRef.current) {
+            const { line, col } = gotoLine;
+            editorRef.current.revealLineInCenter(line);
+            editorRef.current.setPosition({ lineNumber: line, column: col });
+            editorRef.current.focus();
+        }
+    }, [gotoLine]);
 
     // 编辑器加载完成时的回调
     const handleEditorDidMount = (editor: any, monaco: any) => {
@@ -51,7 +64,7 @@ export const CodeEditor: React.FC<EditorProps> = ({
 
     return (
         <div className="flex-1 flex flex-col overflow-hidden border border-white/10 rounded-xl bg-black/40 backdrop-blur-md relative group h-full">
-            
+
             {/* 核心编辑器区域 */}
             <div className="flex-1 overflow-hidden relative pt-2">
                 <Editor
@@ -66,7 +79,7 @@ export const CodeEditor: React.FC<EditorProps> = ({
                         stickyScroll: { enabled: false },
                         minimap: { enabled: false }, // 是否开启右侧小地图
                         scrollBeyondLastLine: false,
-                        wordWrap: 'on', // 自动换行
+                        wordWrap: 'off', // 自动换行
                         automaticLayout: true, // 自动响应容器大小变化
                         lineHeight: 24,
                         padding: { top: 16 },
