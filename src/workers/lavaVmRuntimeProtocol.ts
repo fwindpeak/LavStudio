@@ -19,4 +19,5 @@ export type LavaVmWorkerEvent =
   | { type: 'screen'; width: number; height: number; data: ArrayBuffer }
   | { type: 'lifecycle'; state: VmLifecycleState; payload?: unknown }
   | { type: 'finished' }
-  | { type: 'error'; message: string; payload?: unknown };
+  | { type: 'error'; message: string; payload?: unknown }
+  | { type: 'fileSync'; files: RuntimeFilePayload[]; deletedPaths: string[] };

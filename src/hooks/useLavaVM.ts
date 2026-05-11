@@ -222,8 +222,18 @@ export function useLavaVM(onLog: (msg: string) => void) {
                 setVmState('faulted', message.payload ?? message.message);
                 log(`[VM Worker Error] ${message.message}`);
                 return;
+            case 'fileSync': {
+                // Sync VFS changes made by the VM back to the main-thread VFS
+                for (const f of message.files) {
+                    vm.vfs.addFile(f.path, new Uint8Array(f.data));
+                }
+                for (const p of message.deletedPaths) {
+                    vm.vfs.deleteFile(p);
+                }
+                return;
+            }
         }
-    }, [log, setVmState]);
+    }, [log, setVmState, vm]);
 
     const ensureWorker = useCallback(() => {
         if (workerRef.current) {

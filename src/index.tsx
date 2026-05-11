@@ -267,7 +267,13 @@ export function App() {
   };
 
   useEffect(() => {
-    localStorage.setItem('lavax_tabs', JSON.stringify(tabs.map(t => ({ ...t, bin: undefined })))); // Don't save large binaries to localstorage
+    try {
+      // Don't save large binaries or assembly to localstorage
+      localStorage.setItem('lavax_tabs', JSON.stringify(tabs.map(t => ({ id: t.id, name: t.name, content: t.content }))));
+    } catch (e) {
+      // QuotaExceededError: silently ignore, tabs are still in memory
+      console.warn('localStorage quota exceeded, tabs not persisted:', e);
+    }
   }, [tabs]);
 
   const addTab = () => {

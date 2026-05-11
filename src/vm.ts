@@ -819,19 +819,16 @@ export class LavaXVM {
               }
               this.consecutiveNoProgressSlices = (madeProgress || explicitlyYielded) ? 0 : (this.consecutiveNoProgressSlices + 1);
               this.consecutiveTightLoopSlices = stuckInTightLoop ? (this.consecutiveTightLoopSlices + 1) : 0;
-              const hitBusyLimit = this.consecutiveBusySlices >= VM_WATCHDOG_MAX_BUSY_SLICES;
               const hitNoProgressLimit = this.consecutiveNoProgressSlices >= VM_WATCHDOG_MAX_NO_PROGRESS_SLICES;
 
-              if (hitNoProgressLimit || (hitBusyLimit && !stuckInTightLoop)) {
+              if (hitNoProgressLimit) {
                 const pc = this.pc - 1;
                 const opcode = pc < this.codeLength ? this.fd[pc] : null;
                 const opName = opcode !== null ? (Op[opcode] || SystemOp[opcode] || `0x${opcode.toString(16)}`) : 'EOF';
 
                 this.pause({
                   kind: 'watchdog',
-                  message: hitNoProgressLimit
-                    ? `Paused after ${this.consecutiveNoProgressSlices} no-progress slices (at PC 0x${pc.toString(16)}: ${opName})`
-                    : `Paused after ${this.consecutiveBusySlices} busy slices (at PC 0x${pc.toString(16)}: ${opName}) to keep the page responsive`,
+                  message: `Paused after ${this.consecutiveNoProgressSlices} no-progress slices (at PC 0x${pc.toString(16)}: ${opName})`,
                 });
               }
             } else {

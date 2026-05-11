@@ -536,7 +536,7 @@ export class SyscallHandler {
                 const fp = vm.pop(), count = vm.pop(), size = vm.pop(), buf = vm.resolveAddress(vm.pop());
                 const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(fp));
                 if (!h) return 0;
-                
+
                 // LavaX spec: size is ignored, count is number of bytes
                 const toRead = Math.min(count, h.data.length - h.pos);
                 if (toRead > 0) {
@@ -561,12 +561,12 @@ export class SyscallHandler {
                 const whence = vm.pop(), offset = vm.pop(), fp = vm.pop();
                 const h = vm.vfs.getHandle(this.resolveOfficialFileHandle(fp));
                 if (!h) return -1;
-                
+
                 let newPos = h.pos;
                 if (whence === 0) newPos = offset;
                 else if (whence === 1) newPos += offset;
                 else if (whence === 2) newPos = h.data.length + offset;
-                
+
                 if (newPos < 0) newPos = 0;
                 h.pos = newPos;
                 return h.pos; // Return current position
@@ -615,19 +615,42 @@ export class SyscallHandler {
                 return 0;
             }
             case SystemOp.FileList: {
-                // Peek ptr, don't pop until done
                 const ptr = vm.resolveAddress(vm.stk[vm.sp - 1]);
 
-                // Initialize state if first call
+                // 1. 初始化状态
                 if (!this.fileListState) {
                     const entries = vm.vfs.getFiles();
-                    const currentDir = vm.vfs.cwd.endsWith('/') ? vm.vfs.cwd : vm.vfs.cwd + '/';
-                    const localFiles = entries
-                        .filter(e => e.path.startsWith(currentDir) && !e.path.slice(currentDir.length).includes('/'))
-                        .map(e => e.path.slice(currentDir.length));
+
+                    let currentDir = vm.vfs.cwd || '/';
+                    if (!currentDir.endsWith('/')) currentDir += '/';
+
+                    const seen = new Set<string>();
+                    const localFiles: string[] = [];
+
+                    // 保留之前的修复：添加返回上层目录的选项
+                    if (currentDir !== '/') {
+                        localFiles.push('..');
+                        seen.add('..');
+                    }
+
+                    for (const e of entries) {
+                        if (!e.path.startsWith(currentDir)) continue;
+
+                        const rel = e.path.slice(currentDir.length);
+                        if (!rel) continue;
+
+                        // 保留之前的修复：提取当前层级的文件或文件夹名称
+                        const name = rel.split('/')[0];
+
+                        if (!name) continue;
+                        if (!seen.has(name)) {
+                            seen.add(name);
+                            localFiles.push(name);
+                        }
+                    }
 
                     if (localFiles.length === 0) {
-                        vm.pop(); // Consume argument
+                        vm.pop();
                         return 0;
                     }
 
@@ -641,73 +664,80 @@ export class SyscallHandler {
 
                 const s = this.fileListState;
                 const fnum = s.files.length;
+                let action = -1; // -1: 继续, 0: 取消(ESC), 1: 选中(ENTER)
 
-                // 1. Render UI
-                vm.graphics.clearGraphBuffer();
+                // 2. 核心修复：【先】处理按键输入，更新状态
+                if (vm.keyBuffer.length > 0) {
+                    const key = vm.keyBuffer.shift()!;
+                    const KEY_UP = 20, KEY_DOWN = 21, KEY_LEFT = 23, KEY_RIGHT = 22;
+                    const KEY_ENTER = 13, KEY_ESC = 27;
+
+                    switch (key) {
+                        case KEY_UP:
+                            if (s.fpos > 0) s.fpos--;
+                            else if (s.fnum_i > 0) s.fnum_i--;
+                            break;
+                        case KEY_DOWN:
+                            if (s.fnum_i + s.fpos < fnum - 1) {
+                                if (s.fpos < 4) s.fpos++;
+                                else s.fnum_i++;
+                            }
+                            break;
+                        case KEY_LEFT:
+                            if (s.fnum_i >= 5) {
+                                s.fnum_i -= 5;
+                            } else {
+                                s.fnum_i = 0;
+                                s.fpos = 0;
+                            }
+                            break;
+                        case KEY_RIGHT:
+                            if (s.fnum_i + s.fpos + 5 < fnum) {
+                                s.fnum_i += 5;
+                            } else if (s.fnum_i + 5 < fnum) {
+                                s.fnum_i += 5;
+                                s.fpos = fnum - s.fnum_i - 1;
+                            }
+                            break;
+                        case KEY_ENTER:
+                            action = 1;
+                            break;
+                        case KEY_ESC:
+                            action = 0;
+                            break;
+                    }
+                }
+
+                // 判断如果按下了 ENTER 或 ESC，直接处理并退出指令
+                if (action === 1) {
+                    const selected = s.files[s.fnum_i + s.fpos];
+                    const bytes = iconv.encode(selected, 'gbk');
+                    vm.memory.set(bytes, s.ptr);
+                    vm.memory[s.ptr + bytes.length] = 0; // 补充 \0 结尾
+                    this.fileListState = null;
+                    vm.pop(); // Consume argument
+                    return 1;
+                } else if (action === 0) {
+                    this.fileListState = null;
+                    vm.pop(); // Consume argument
+                    return 0;
+                }
+
+                // 3. 【后】渲染 UI
+                // 此时渲染使用的 s.fpos 一定是按键处理过后的“最新状态”
+                vm.graphics.clearVRAM();
                 const fnum_show = Math.min(fnum - s.fnum_i, 5);
                 for (let i = 0; i < fnum_show; i++) {
                     const filename = s.files[s.fnum_i + i];
                     const bytes = iconv.encode(filename, 'gbk');
-                    // Mode 0x81: Big Font (16px), GBUF, Copy
-                    vm.graphics.TextOut(0, i * 16, bytes, 0x81);
+                    vm.graphics.TextOut(0, i * 16, bytes, 0xC1);
                 }
-                // Highlight block: Mode 2 is XOR in Block
-                vm.graphics.Block(0, s.fpos * 16, 159, s.fpos * 16 + 15, 2);
+
+                // 画反色光标框
+                vm.graphics.Box(0, s.fpos * 16, 159, s.fpos * 16 + 15, 1, 2);
                 vm.graphics.flushScreen();
 
-                // 2. Handle Input
-                if (vm.keyBuffer.length === 0) {
-                    return undefined; // Yield and wait for key
-                }
-
-                const key = vm.keyBuffer.shift()!;
-                // Standard GVM keys
-                const KEY_UP = 20, KEY_DOWN = 21, KEY_LEFT = 23, KEY_RIGHT = 22;
-                const KEY_ENTER = 13, KEY_ESC = 27;
-
-                switch (key) {
-                    case KEY_UP:
-                        if (s.fpos > 0) s.fpos--;
-                        else if (s.fnum_i > 0) s.fnum_i--;
-                        break;
-                    case KEY_DOWN:
-                        if (s.fnum_i + s.fpos < fnum - 1) {
-                            if (s.fpos < 4) s.fpos++;
-                            else s.fnum_i++;
-                        }
-                        break;
-                    case KEY_LEFT:
-                        if (s.fnum_i > 5) {
-                            s.fnum_i -= 5;
-                        } else {
-                            s.fnum_i = 0;
-                            s.fpos = 0;
-                        }
-                        break;
-                    case KEY_RIGHT:
-                        if (s.fnum_i + s.fpos + 5 < fnum) {
-                            s.fnum_i += 5;
-                        } else if (s.fnum_i + 5 < fnum) {
-                            s.fnum_i += 5;
-                            s.fpos = fnum - s.fnum_i - 1;
-                        }
-                        break;
-                    case KEY_ENTER: {
-                        const selected = s.files[s.fnum_i + s.fpos];
-                        const bytes = iconv.encode(selected, 'gbk');
-                        vm.memory.set(bytes, s.ptr);
-                        vm.memory[s.ptr + bytes.length] = 0;
-                        this.fileListState = null;
-                        vm.pop(); // Consume argument
-                        return 1;
-                    }
-                    case KEY_ESC:
-                        this.fileListState = null;
-                        vm.pop(); // Consume argument
-                        return 0;
-                }
-
-                // If not returned, re-execute for next key/redraw
+                // 4. Yield，交出控制权等待下一次 Tick 或按键触发
                 return undefined;
             }
 

@@ -59,13 +59,13 @@ export const SYSCALL_LIST: SyscallInfo[] = [
   { name: 'fopen', op: SystemOp.fopen, params: 2, paramTypes: [1, 1], hasReturn: true },
   { name: 'fclose', op: SystemOp.fclose, params: 1, paramTypes: [0], hasReturn: false },
   { name: 'fread', op: SystemOp.fread, params: 4, paramTypes: [1, 0, 0, 0], hasReturn: true },
-  { name: 'fwrite', op: SystemOp.fwrite, params: 4, paramTypes: [1, 0, 0, 0], hasReturn: false },
-  { name: 'fseek', op: SystemOp.fseek, params: 3, paramTypes: [0, 0, 0], hasReturn: false },
+  { name: 'fwrite', op: SystemOp.fwrite, params: 4, paramTypes: [1, 0, 0, 0], hasReturn: true },
+  { name: 'fseek', op: SystemOp.fseek, params: 3, paramTypes: [0, 0, 0], hasReturn: true },  // returns current position or -1 on error
   { name: 'ftell', op: SystemOp.ftell, params: 1, paramTypes: [0], hasReturn: true },
   { name: 'feof', op: SystemOp.feof, params: 1, paramTypes: [0], hasReturn: true },
   { name: 'rewind', op: SystemOp.rewind, params: 1, paramTypes: [0], hasReturn: false },
   { name: 'getc', op: SystemOp.getc, params: 1, paramTypes: [0], hasReturn: true },
-  { name: 'putc', op: SystemOp.putc, params: 2, paramTypes: [0, 0], hasReturn: false },
+  { name: 'putc', op: SystemOp.putc, params: 2, paramTypes: [0, 0], hasReturn: true },  // returns char written or -1 on error
   { name: 'sprintf', op: SystemOp.sprintf, params: 2, paramTypes: [1, 1], hasReturn: false, isVariadic: true },
   { name: 'MakeDir', op: SystemOp.MakeDir, params: 1, paramTypes: [1], hasReturn: true },
   { name: 'DeleteFile', op: SystemOp.DeleteFile, params: 1, paramTypes: [1], hasReturn: true },
@@ -74,7 +74,7 @@ export const SYSCALL_LIST: SyscallInfo[] = [
   { name: 'memmove', op: SystemOp.memmove, params: 3, paramTypes: [1, 1, 0], hasReturn: false },
   { name: 'Crc16', op: SystemOp.Crc16, params: 2, paramTypes: [1, 0], hasReturn: true },
   { name: 'Secret', op: SystemOp.Secret, params: 3, paramTypes: [1, 0, 1], hasReturn: true },
-  { name: 'ChDir', op: SystemOp.ChDir, params: 1, paramTypes: [1], hasReturn: false },
+  { name: 'ChDir', op: SystemOp.ChDir, params: 1, paramTypes: [1], hasReturn: true },  // returns nonzero on success, 0 on failure
   { name: 'FileList', op: SystemOp.FileList, params: 1, paramTypes: [1], hasReturn: true },
   { name: 'GetTime', op: SystemOp.GetTime, params: 1, paramTypes: [1], hasReturn: false },
   { name: 'SetTime', op: SystemOp.SetTime, params: 1, paramTypes: [1], hasReturn: false },

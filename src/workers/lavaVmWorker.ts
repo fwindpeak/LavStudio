@@ -26,6 +26,19 @@ async function applyRuntimeFiles(vm: LavaXVM, files: RuntimeFilePayload[]) {
   }
 }
 
+function collectFilesFromVfs(vm: LavaXVM): { files: RuntimeFilePayload[]; transfers: ArrayBuffer[] } {
+  const files: RuntimeFilePayload[] = [];
+  const transfers: ArrayBuffer[] = [];
+  for (const entry of vm.vfs.getFiles()) {
+    const data = vm.vfs.getFile(entry.path);
+    if (data === undefined) continue;
+    const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    files.push({ path: entry.path, data: buf });
+    transfers.push(buf);
+  }
+  return { files, transfers };
+}
+
 function wireVm(vm: LavaXVM) {
   vm.onLog = (message) => {
     postEvent({ type: 'log', message });
@@ -67,6 +80,10 @@ async function handleRun(message: Extract<LavaVmWorkerRequest, { type: 'run' }>)
 
   const vm = await createVm(!!message.debug);
   await applyRuntimeFiles(vm, message.files);
+
+  // Track initial file set so we can detect deletions after run
+  const initialPaths = new Set(vm.vfs.getFiles().map(f => f.path));
+
   vm.load(new Uint8Array(message.program));
 
   try {
@@ -78,6 +95,12 @@ async function handleRun(message: Extract<LavaVmWorkerRequest, { type: 'run' }>)
       payload: cloneLifecyclePayload(vm.getPauseSnapshot?.()),
     });
   }
+
+  // Sync VFS back to main thread after run ends (finished, stopped, or paused)
+  const { files, transfers } = collectFilesFromVfs(vm);
+  const currentPaths = new Set(files.map(f => f.path));
+  const deletedPaths = Array.from(initialPaths).filter(p => !currentPaths.has(p));
+  postEvent({ type: 'fileSync', files, deletedPaths }, transfers);
 }
 
 workerScope.onmessage = async (event: MessageEvent<LavaVmWorkerRequest>) => {

@@ -11,7 +11,8 @@ export class VirtualFileSystem {
     private driver: VFSStorageDriver;
 
     constructor(driver?: VFSStorageDriver) {
-        this.driver = driver || new LocalStorageDriver();
+        // Default to IndexedDB (no quota issues); LocalStorage is a fallback for environments without IndexedDB
+        this.driver = driver ?? (typeof indexedDB !== 'undefined' ? new IndexedDBDriver() : new LocalStorageDriver());
         this.ready = this.init();
     }
 
@@ -225,17 +226,23 @@ export class VirtualFileSystem {
                 return 0; // NULL
             }
             if (isWrite || isAppend || isPlus) {
-                // Create new file
+                // Create new file and persist immediately
                 fileData = new Uint8Array(0);
                 this.files.set(resolved, fileData);
+                this.ready.then(() => {
+                    this.driver.persist(resolved, new Uint8Array(0)).catch(console.error);
+                });
             } else {
                 return 0;
             }
         } else {
             if (isWrite) {
-                // Truncate
+                // Truncate and persist the truncated (empty) file
                 fileData = new Uint8Array(0);
                 this.files.set(resolved, fileData);
+                this.ready.then(() => {
+                    this.driver.persist(resolved, new Uint8Array(0)).catch(console.error);
+                });
             }
         }
 
