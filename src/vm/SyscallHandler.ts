@@ -352,6 +352,7 @@ export class SyscallHandler {
 
                 const oldMode = vm.graphics.graphMode;
                 vm.graphics.graphMode = mode;
+                vm.graphics.resetPaletteForMode(mode);
                 if (mode === 4) {
                     vm.graphics.bgColor = 0;
                     vm.graphics.fgColor = 15;

@@ -25,42 +25,15 @@ export class GraphicsEngine {
     }
 
     private initializeDefaultPalette() {
-        // Standard VGA 16 colors
-        const vgaColors = [
-            0, 0, 0,       // 0: Black
-            0, 0, 170,     // 1: Blue
-            0, 170, 0,     // 2: Green
-            0, 170, 170,   // 3: Cyan
-            170, 0, 0,     // 4: Red
-            170, 0, 170,   // 5: Magenta
-            170, 85, 0,    // 6: Brown
-            170, 170, 170, // 7: Light Gray
-            85, 85, 85,    // 8: Dark Gray
-            85, 85, 255,   // 9: Bright Blue
-            85, 255, 85,   // 10: Bright Green
-            85, 255, 255,  // 11: Bright Cyan
-            255, 85, 85,   // 12: Bright Red
-            255, 85, 255,  // 13: Bright Magenta
-            255, 255, 85,  // 14: Yellow
-            255, 255, 255  // 15: White
-        ];
-
-        for (let i = 0; i < 16; i++) {
-            this.palette[i * 4] = vgaColors[i * 3];
-            this.palette[i * 4 + 1] = vgaColors[i * 3 + 1];
-            this.palette[i * 4 + 2] = vgaColors[i * 3 + 2];
-            this.palette[i * 4 + 3] = 255;
-        }
-
-        // 6x6x6 color cube (indices 16-231)
+        // 6x6x6 color cube for 256-color mode (indices 16-231)
         const levels = [0, 51, 102, 153, 204, 255];
         let idx = 16;
         for (let r = 0; r < 6; r++) {
             for (let g = 0; g < 6; g++) {
                 for (let b = 0; b < 6; b++) {
-                    this.palette[idx * 4] = levels[r];
+                    this.palette[idx * 4] = levels[b];
                     this.palette[idx * 4 + 1] = levels[g];
-                    this.palette[idx * 4 + 2] = levels[b];
+                    this.palette[idx * 4 + 2] = levels[r];
                     this.palette[idx * 4 + 3] = 255;
                     idx++;
                 }
@@ -75,6 +48,44 @@ export class GraphicsEngine {
             this.palette[(232 + i) * 4 + 2] = gray;
             this.palette[(232 + i) * 4 + 3] = 255;
         }
+    }
+
+    /**
+     * Reset palette to the default for the given graph mode.
+     * mode=1: no palette (2-color uses direct pixel mapping)
+     * mode=4: 16 grayscale levels, index 0=white(0xFF) to index 15=black(0x00)
+     * mode=8: 256-color palette matching reference Palette256()
+     */
+    public resetPaletteForMode(mode: number) {
+        if (mode === 4) {
+            // 16 grayscale: (15-i)*0x11, so index 0=0xFF(white), index 15=0x00(black)
+            for (let i = 0; i < 16; i++) {
+                const gray = (15 - i) * 0x11;
+                this.palette[i * 4] = gray;
+                this.palette[i * 4 + 1] = gray;
+                this.palette[i * 4 + 2] = gray;
+                this.palette[i * 4 + 3] = 255;
+            }
+        } else if (mode === 8) {
+            // Reference Palette256(): index 0=black, index 255=white, 16-240: 5x9x5 cube
+            const lv9 = [0, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0, 0xff];
+            const lv5 = [0, 0x40, 0x80, 0xc0, 0xff];
+            this.palette[0] = this.palette[1] = this.palette[2] = 0;
+            this.palette[3] = 255;
+            this.palette[255 * 4] = this.palette[255 * 4 + 1] = this.palette[255 * 4 + 2] = 255;
+            this.palette[255 * 4 + 3] = 255;
+            for (let i = 0; i < 225; i++) {
+                const b = lv5[Math.floor(i / 5) % 5];
+                const g = lv9[Math.floor(i / 25)];
+                const r = lv5[i % 5];
+                this.palette[(16 + i) * 4] = b;
+                this.palette[(16 + i) * 4 + 1] = g;
+                this.palette[(16 + i) * 4 + 2] = r;
+                this.palette[(16 + i) * 4 + 3] = 255;
+            }
+            this.initializeDefaultPalette(); // fill indices 16-255 with cube/ramp fallback
+        }
+        // mode=1: no palette needed
     }
 
     public cursorX = 0;
