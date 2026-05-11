@@ -30,7 +30,7 @@ LavStudio is a modern, web-based IDE and emulator for the **LavaX** platform —
 ## 📂 Project Structure
 
 ```text
-lavstudio/
+LavStudio/
 ├── src/
 │   ├── compiler.ts              # LavaX C → Assembly compiler
 │   ├── decompiler.ts            # .lav → Assembly / C source decompiler

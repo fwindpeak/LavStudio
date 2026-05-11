@@ -20,7 +20,6 @@ export class VirtualFileSystem {
         try {
             await this.driver.ready;
             const storedFiles = await this.driver.getAll();
-            console.log(`[VFS] Loaded ${storedFiles.size} entries from ${this.driver.name}`);
 
             const normalizedFiles = new Map<string, Uint8Array>();
             let migratedCount = 0;
@@ -42,22 +41,18 @@ export class VirtualFileSystem {
                 }
             }
 
-            if (migratedCount > 0) {
-                console.log(`[VFS] Migrated ${migratedCount} paths to absolute format (leading slash)`);
-            }
+            // migratedCount ignored (migration is transparent)
 
             // Migration logic: If current driver is empty and it's IndexedDB, try to migrate from localStorage
             if (normalizedFiles.size === 0 && this.driver instanceof IndexedDBDriver) {
                 const lsDriver = new LocalStorageDriver();
                 const lsFiles = await lsDriver.getAll();
                 if (lsFiles.size > 0) {
-                    console.log(`[VFS] Found ${lsFiles.size} files in localStorage, migrating to IndexedDB...`);
                     for (const [path, data] of lsFiles) {
                         const normalized = path.startsWith('/') ? path : '/' + path;
                         normalizedFiles.set(normalized, data);
                         await this.driver.persist(normalized, data);
                     }
-                    console.log("[VFS] Migration from localStorage complete");
                 }
             }
 
@@ -87,13 +82,11 @@ export class VirtualFileSystem {
         if (endsWithSlash && resolved !== '/') {
             resolved += '/';
         }
-        console.log(`[VFS] resolvePath("${original}") -> "${resolved}" (cwd: "${this.cwd}")`);
         return resolved;
     }
 
     public addFile(path: string, data: Uint8Array) {
         const resolved = this.resolvePath(path);
-        console.log(`[VFS] addFile("${path}") -> resolved: "${resolved}", size: ${data.length}`);
 
         // Ensure parent directories exist
         const parts = resolved.split('/').filter(Boolean);
@@ -102,7 +95,6 @@ export class VirtualFileSystem {
             current += "/" + parts[i];
             const dirMarker = current + "/";
             if (!this.files.has(dirMarker)) {
-                console.log(`[VFS] Automatically creating parent directory marker: "${dirMarker}"`);
                 this.files.set(dirMarker, new Uint8Array(0));
                 this.driver.persist(dirMarker, new Uint8Array(0)).catch(console.error);
             }
@@ -117,13 +109,11 @@ export class VirtualFileSystem {
     public getFile(path: string) {
         const resolved = this.resolvePath(path);
         const data = this.files.get(resolved);
-        console.log(`[VFS] getFile("${path}") -> resolved: "${resolved}", found: ${!!data}`);
         return data;
     }
 
     public deleteFile(path: string) {
         const resolved = this.resolvePath(path);
-        console.log(`[VFS] deleteFile("${path}") -> resolved: "${resolved}"`);
         this.files.delete(resolved);
         this.ready.then(() => {
             this.driver.remove(resolved).catch(console.error);
@@ -222,7 +212,6 @@ export class VirtualFileSystem {
 
         if (!fileData) {
             if (isRead && !isPlus) {
-                console.log(`[VFS] openFile("${path}") failed: file not found (mode "${mode}")`);
                 return 0; // NULL
             }
             if (isWrite || isAppend || isPlus) {
@@ -255,7 +244,6 @@ export class VirtualFileSystem {
             data: fileData
         });
 
-        console.log(`[VFS] openFile("${path}") -> handle: ${handle}, mode: "${mode}", size: ${fileData.length}, pos: ${pos}`);
         return handle;
     }
 

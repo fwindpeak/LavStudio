@@ -5,7 +5,7 @@
 ## 📖 文档结构
 
 ```
-lavstudio/                          ← 项目根目录
+LavStudio/                          ← 项目根目录
 ├── PROJECT_STATUS.md               ← 项目整体状态与路线图
 └── docs/
     ├── ai/

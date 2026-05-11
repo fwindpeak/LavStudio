@@ -31,7 +31,7 @@ LavaX C Source ──[Compiler]──> Assembly ──[Assembler]──> .lav Bi
 ## 📁 Repository Structure
 
 ```
-lavstudio/
+LavStudio/
 ├── src/
 │   ├── compiler.ts                  # LavaX C → Assembly compiler
 │   ├── decompiler.ts                # .lav → Assembly / C source decompiler

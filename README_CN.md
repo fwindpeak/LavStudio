@@ -30,7 +30,7 @@ LavStudio 是一个现代化的基于 Web 的集成开发环境 (IDE) 和 **Lava
 ## 📂 项目结构
 
 ```text
-lavstudio/
+LavStudio/
 ├── src/
 │   ├── compiler.ts              # LavaX C → 汇编编译器
 │   ├── decompiler.ts            # .lav → 汇编 / C 源码反编译器
