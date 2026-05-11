@@ -488,7 +488,22 @@ export class LavaXDecompiler {
           const cond = op === 'JNZ' ? `!(${rawCond})` : rawCond;
           const target = args[0], tAddr = this.labelToAddr.get(target);
           if (tAddr !== undefined) {
-              const targetLine = this.addrToLine.get(tAddr)!, pT = lines[targetLine - 1]?.trim() || "";
+              const targetLine = this.addrToLine.get(tAddr)!;
+              // Backwards jump: this is a loop-back (do-while tail or break-less while).
+              // Do NOT set i backwards — that causes infinite reprocessing.
+              // Emit a do-while or goto based on condition.
+              if (targetLine <= i) {
+                const invertCond = op === 'JNZ' ? rawCond : `!(${rawCond})`;
+                // Check if this is a trivially-true condition (while(1))
+                const stripped = stripOuterParens(invertCond);
+                if (stripped === '1' || stripped === '-1' || stripped === 'true') {
+                  bSrc += `${indent}// loop back (while 1)\n`;
+                } else {
+                  bSrc += `${indent}if (${invertCond}) goto ${target}; // do-while back\n`;
+                }
+                continue;
+              }
+              const pT = lines[targetLine - 1]?.trim() || "";
               if (pT.startsWith('JMP')) {
                   const jL = pT.split(' ')[1], ja = this.labelToAddr.get(jL);
                   if (ja !== undefined) {

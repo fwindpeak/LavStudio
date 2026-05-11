@@ -671,9 +671,7 @@ export class LavaXCompiler {
       }
     } catch (e: any) {
       const info = this.getLineInfo(this.pos);
-      const locationStr = info.file
-        ? `${info.file}:${info.line}:${info.col}`
-        : `line ${info.line}, column ${info.col}`;
+      const locationStr = `${info.file || 'source'}:${info.line}:${info.col}`;
       const contextStart = Math.max(0, this.pos - 20);
       const contextEnd = Math.min(this.src.length, this.pos + 30);
       const context = this.src.substring(contextStart, contextEnd);
@@ -1750,6 +1748,10 @@ export class LavaXCompiler {
       } else {
         throw new Error(`-- requires lvalue, got ${token} `);
       }
+    } else if (this.match('+')) {
+      // Unary plus: just parse the expression (no code generation needed)
+      this.parseUnary();
+      return true;
     } else if (this.match('(')) {
       const savedPos = this.pos;
       const token = this.parseToken();

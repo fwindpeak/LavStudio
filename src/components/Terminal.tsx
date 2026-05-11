@@ -17,8 +17,8 @@ interface TerminalProps {
 /** Split log text into plain and clickable link segments. */
 function renderWithLinks(text: string, onGoto?: (file: string, line: number, col: number) => void): React.ReactNode {
     if (!onGoto) return text;
-    // Matches "at file.h:N:M" or "at line N, column M"
-    const re = /\bat ([\w./\\-]+\.\w+):(\d+):(\d+)|\bat line (\d+), column (\d+)/g;
+    // Matches "at file.h:N:M" (including Chinese filenames) or "at line N, column M"
+    const re = /\bat ([^\s:]+\.[\w]+):(\d+):(\d+)|\bat line (\d+), column (\d+)/g;
     const parts: React.ReactNode[] = [];
     let last = 0, m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {

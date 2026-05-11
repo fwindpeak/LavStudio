@@ -977,7 +977,9 @@ export class LavaXVM {
     const type = lp & 0x70000;
     if (type === HANDLE_TYPE_BYTE) return this.memory[addr];
     if (type === HANDLE_TYPE_WORD) return this.memView.getInt16(addr, true);
-    return this.memView.getInt32(addr, true);
+    if (type === HANDLE_TYPE_DWORD) return this.memView.getInt32(addr, true);
+    // No type bits: raw address — official VM defaults to byte (char) access
+    return this.memory[addr];
   }
 
   private opIncDec(delta: number, isPrefix: boolean) {
